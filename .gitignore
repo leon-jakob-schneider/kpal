@@ -1,0 +1,23 @@
+.DS_Store
+
+# IDEs
+.idea/
+*.iml
+
+# Amper / Kotlin / Gradle caches
+.amper/
+.gradle/
+.kotlin/
+
+# Build outputs
+**/build/
+out/
+
+# Android local machine config
+local.properties
+captures/
+
+# Xcode user data
+DerivedData/
+**/xcuserdata/
+**/*.xcuserstate

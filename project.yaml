@@ -1,0 +1,4 @@
+modules:
+  - ./audio
+  - ./audia-qa-android-app
+  - ./audia-qa-ios-app
