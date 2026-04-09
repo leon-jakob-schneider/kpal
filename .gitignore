@@ -12,6 +12,7 @@
 # Build outputs
 **/build/
 out/
+/.derived-data/
 
 # Android local machine config
 local.properties
