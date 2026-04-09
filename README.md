@@ -1,3 +1,3 @@
 # kpal
 
-![kpal icon](assets/repo-icon.png)
+<img src="assets/repo-icon.png" alt="kpal icon" width="160" />
