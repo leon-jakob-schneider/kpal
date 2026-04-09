@@ -1,4 +1,4 @@
-package app.audia.qa.androidapp
+package app.device.qa.androidapp
 
 import android.Manifest
 import android.app.Activity
@@ -16,16 +16,17 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
-import app.miso.audio.AndroidAudioDiagnosticsEngine
 import app.miso.audio.AudioDiagnosticsCallbacks
 import app.miso.audio.AudioDiagnosticsConfig
 import app.miso.audio.AudioDiagnosticsState
+import app.miso.device.AndroidDevice
+import app.miso.device.DeviceConfig
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class AudiaQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
-    private lateinit var engine: AndroidAudioDiagnosticsEngine
+class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
+    private lateinit var device: AndroidDevice
     private lateinit var statusView: TextView
     private lateinit var routeView: TextView
     private lateinit var counterView: TextView
@@ -37,23 +38,25 @@ class AudiaQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        engine = AndroidAudioDiagnosticsEngine(
+        device = AndroidDevice(
             context = applicationContext,
             callbacks = this,
-            config = AudioDiagnosticsConfig(
-                sampleRate = 24_000,
-                ioBufferFrames = 1_024,
-                preferSpeaker = true,
-                voiceProcessing = true,
+            config = DeviceConfig(
+                audio = AudioDiagnosticsConfig(
+                    sampleRate = 24_000,
+                    ioBufferFrames = 1_024,
+                    preferSpeaker = true,
+                    voiceProcessing = true,
+                ),
             ),
         )
         setContentView(createContent())
-        renderState(engine.currentState())
+        renderState(device.audio.currentState())
         appendLog("Open this on a real Android device. Speak, play the tone, then compare route and level behavior.")
     }
 
     override fun onDestroy() {
-        engine.stop()
+        device.audio.stop()
         super.onDestroy()
     }
 
@@ -61,7 +64,7 @@ class AudiaQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_RECORD_AUDIO) {
             if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
-                engine.start()
+                device.audio.start()
             } else {
                 appendLog("Microphone permission denied.")
             }
@@ -87,7 +90,7 @@ class AudiaQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
             setBackgroundColor(Color.parseColor("#F2EFE7"))
         }
 
-        content.addView(title("Miso Audio Diagnostics"))
+        content.addView(title("Device Audio QA"))
         content.addView(body("Use this app on a real device to validate mic input, speaker output, route changes, and AirPods/Bluetooth behavior before touching the main app."))
 
         statusView = panelText()
@@ -105,15 +108,15 @@ class AudiaQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
 
         content.addView(button("Start Capture") {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                engine.start()
+                device.audio.start()
             } else {
                 requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
             }
         })
-        content.addView(button("Stop") { engine.stop() })
-        content.addView(button("Play 440 Hz Tone") { engine.playTestTone() })
-        content.addView(button("Play Captured Audio") { engine.playCapturedAudio() })
-        content.addView(button("Clear Capture") { engine.clearCapture() })
+        content.addView(button("Stop") { device.audio.stop() })
+        content.addView(button("Play 440 Hz Tone") { device.audio.playTestTone() })
+        content.addView(button("Play Captured Audio") { device.audio.playCapturedAudio() })
+        content.addView(button("Clear Capture") { device.audio.clearCapture() })
 
         content.addView(title("Log"))
         logView = TextView(this).apply {

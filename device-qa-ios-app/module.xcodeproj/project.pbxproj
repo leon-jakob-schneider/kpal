@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		18415419F95A8A21A0E19113 /* audia-qa-ios-app.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "audia-qa-ios-app.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		18415419F95A8A21A0E19113 /* device-qa-ios-app.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "device-qa-ios-app.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		184155BD441249F0C3E37B96 /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.info; name = Info.plist; path = src/Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -48,7 +48,7 @@
 		184158D0A823B392873B1098 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				18415419F95A8A21A0E19113 /* audia-qa-ios-app.app */,
+				18415419F95A8A21A0E19113 /* device-qa-ios-app.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -74,7 +74,7 @@
 			);
 			name = app;
 			productName = app;
-			productReference = 18415419F95A8A21A0E19113 /* audia-qa-ios-app.app */;
+			productReference = 18415419F95A8A21A0E19113 /* device-qa-ios-app.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -177,9 +177,9 @@
 					"@loader_path/Frameworks",
 				);
 				ONLY_ACTIVE_ARCH = YES;
-				PRODUCT_BUNDLE_IDENTIFIER = "audia-qa-ios-app";
+				PRODUCT_BUNDLE_IDENTIFIER = "device-qa-ios-app";
 				PRODUCT_MODULE_NAME = app;
-				PRODUCT_NAME = "audia-qa-ios-app";
+				PRODUCT_NAME = "device-qa-ios-app";
 				SDKROOT = iphoneos;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
@@ -208,9 +208,9 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "audia-qa-ios-app";
+				PRODUCT_BUNDLE_IDENTIFIER = "device-qa-ios-app";
 				PRODUCT_MODULE_NAME = app;
-				PRODUCT_NAME = "audia-qa-ios-app";
+				PRODUCT_NAME = "device-qa-ios-app";
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1 2";

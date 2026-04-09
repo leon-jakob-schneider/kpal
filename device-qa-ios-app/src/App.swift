@@ -157,7 +157,7 @@ final class AudioQAViewModel: ObservableObject {
         ),
     ]
 
-    private var engine: IosAudioDiagnosticsEngine
+    private var device: IosDevice
     private var currentPreferSpeaker = true
     private let logDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -172,14 +172,14 @@ final class AudioQAViewModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
 
     init() {
-        engine = Self.makeEngine(preferSpeaker: true)
+        device = Self.makeDevice(preferSpeaker: true)
         appendLog("QA app ready. Use the suite to compare built-in iPhone audio with AirPods and export a report at the end.")
         startPolling()
     }
 
     deinit {
         pollTask?.cancel()
-        engine.stop()
+        device.audio.stop()
     }
 
     func beginSuite() {
@@ -223,7 +223,7 @@ final class AudioQAViewModel: ObservableObject {
         }
 
         let granted = await withCheckedContinuation { continuation in
-            engine.requestRecordPermission { allowed in
+            device.audio.requestRecordPermission { allowed in
                 continuation.resume(returning: allowed.boolValue)
             }
         }
@@ -233,32 +233,32 @@ final class AudioQAViewModel: ObservableObject {
             return false
         }
 
-        engine.start()
+        device.audio.start()
         drainLogs()
         refreshState()
         return state.isRunning
     }
 
     func stopSession() {
-        engine.stop()
+        device.audio.stop()
         drainLogs()
         refreshState()
     }
 
     func clearCapture() {
-        engine.clearCapture()
+        device.audio.clearCapture()
         drainLogs()
         refreshState()
     }
 
     func playTestTone() {
-        engine.playTestTone()
+        device.audio.playTestTone()
         drainLogs()
         refreshState()
     }
 
     func playCapturedAudio() {
-        engine.playCapturedAudio()
+        device.audio.playCapturedAudio()
         drainLogs()
         refreshState()
     }
@@ -283,7 +283,7 @@ final class AudioQAViewModel: ObservableObject {
 
     func reportURL() throws -> URL {
         refreshState()
-        let filename = "miso-audio-qa-\(fileDateFormatter.string(from: Date())).txt"
+        let filename = "device-audio-qa-\(fileDateFormatter.string(from: Date())).txt"
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
         try buildReport().write(to: url, atomically: true, encoding: .utf8)
         return url
@@ -328,27 +328,29 @@ final class AudioQAViewModel: ObservableObject {
     }
 
     private func replaceEngine(preferSpeaker: Bool, reason: String) {
-        engine.stop()
+        device.audio.stop()
         currentPreferSpeaker = preferSpeaker
-        engine = Self.makeEngine(preferSpeaker: preferSpeaker)
+        device = Self.makeDevice(preferSpeaker: preferSpeaker)
         appendLog("\(reason). preferSpeaker=\(preferSpeaker)")
         refreshState()
     }
 
-    private static func makeEngine(preferSpeaker: Bool) -> IosAudioDiagnosticsEngine {
-        IosAudioDiagnosticsEngine(
+    private static func makeDevice(preferSpeaker: Bool) -> IosDevice {
+        IosDevice(
             callbacks: nil,
-            config: AudioDiagnosticsConfig(
-                sampleRate: 24_000,
-                ioBufferFrames: 1_024,
-                preferSpeaker: preferSpeaker,
-                voiceProcessing: true
+            config: DeviceConfig(
+                audio: AudioDiagnosticsConfig(
+                    sampleRate: 24_000,
+                    ioBufferFrames: 1_024,
+                    preferSpeaker: preferSpeaker,
+                    voiceProcessing: true
+                )
             )
         )
     }
 
     private func refreshState() {
-        let stateValue = engine.currentState()
+        let stateValue = device.audio.currentState()
         let route = stateValue.route
         state = AudioDiagnosticState(
             isRunning: stateValue.isRunning,
@@ -371,7 +373,7 @@ final class AudioQAViewModel: ObservableObject {
     }
 
     private func drainLogs() {
-        while let line = engine.takeNextLogMessage() {
+        while let line = device.audio.takeNextLogMessage() {
             appendLog(line)
         }
     }
@@ -415,7 +417,7 @@ final class AudioQAViewModel: ObservableObject {
         }.joined(separator: "\n\n")
 
         let summary = """
-        Miso Audio QA Report
+        Device Audio QA Report
         Generated: \(Date().formatted(date: .numeric, time: .standard))
 
         Suite Size: \(activeTests.count)
@@ -527,8 +529,8 @@ struct AudioQALandingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Text("Miso Audio QA")
-                    .font(.system(.largeTitle, design: .rounded, weight: .bold))
+                Text("Device Audio QA")
+                    .font(.system(.largeTitle, design: .rounded).weight(.bold))
                 Text("Choose a full QA suite or run one test in isolation. Each test opens as its own screen and records the user verdict together with diagnostics.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -632,7 +634,7 @@ struct AudioQATestView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Text(test.title)
-                    .font(.system(.title, design: .rounded, weight: .bold))
+                    .font(.system(.title, design: .rounded).weight(.bold))
                 Text(test.summary)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -804,7 +806,7 @@ struct AudioQAResultsView: View {
                 qaCard {
                     VStack(alignment: .leading, spacing: 10) {
                         Text(suite ? "QA Suite Complete" : "QA Test Complete")
-                            .font(.system(.title, design: .rounded, weight: .bold))
+                            .font(.system(.title, design: .rounded).weight(.bold))
                         Text("Export a report that includes all recorded outcomes and the combined diagnostics log.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -899,7 +901,7 @@ private func diagnosticsCard(_ title: String, text: String) -> some View {
 }
 
 @main
-struct AudiaQaIosApp: App {
+struct DeviceQaIosApp: App {
     var body: some Scene {
         WindowGroup {
             AudioQAAppView()
