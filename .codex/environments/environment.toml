@@ -7,3 +7,25 @@ script = '''
 git fetch origin
 git reset --hard origin/$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')
 '''
+
+[[actions]]
+name = "iOS"
+icon = "run"
+command = '''
+[ -f .codex/environments/local.env ] && . .codex/environments/local.env
+DEVICE_ID="${KPAL_IOS_DEVICE_ID:?Set KPAL_IOS_DEVICE_ID in .codex/environments/local.env or your shell environment.}"
+
+xcodebuild \
+  -project device-qa-ios-app/module.xcodeproj \
+  -scheme app \
+  -configuration Debug \
+  -destination "id=$DEVICE_ID" \
+  -derivedDataPath .derived-data/ios-device \
+  -allowProvisioningUpdates \
+  -allowProvisioningDeviceRegistration \
+  build
+
+xcrun devicectl device install app \
+  --device "$DEVICE_ID" \
+  .derived-data/ios-device/Build/Products/Debug-iphoneos/device-qa-ios-app.app
+'''
