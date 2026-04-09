@@ -1,0 +1,13 @@
+product: android/app
+
+dependencies:
+  - ../device
+  - ../io/audio
+
+settings:
+  kotlin:
+    version: 2.2.21
+  android:
+    namespace: app.device.qa.androidapp
+    applicationId: app.device.qa.androidapp
+    minSdk: 23

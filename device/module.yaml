@@ -1,0 +1,10 @@
+product:
+  type: lib
+  platforms: [android, iosArm64, iosSimulatorArm64, iosX64]
+
+dependencies:
+  - ../io/audio
+
+settings:
+  kotlin:
+    version: 2.2.21

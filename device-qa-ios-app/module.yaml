@@ -1,7 +1,8 @@
 product: ios/app
 
 dependencies:
-  - ../audio
+  - ../device
+  - ../io/audio
 
 settings:
   kotlin:

@@ -2,10 +2,10 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
-        android:label="audia-qa-android-app"
+        android:label="device-qa-android-app"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
-            android:name=".AudiaQaAndroidAppActivity"
+            android:name=".DeviceQaAndroidAppActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
