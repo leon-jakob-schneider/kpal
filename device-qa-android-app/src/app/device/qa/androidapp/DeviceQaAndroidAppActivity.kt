@@ -19,14 +19,14 @@ import android.widget.TextView
 import app.miso.audio.AudioDiagnosticsCallbacks
 import app.miso.audio.AudioDiagnosticsConfig
 import app.miso.audio.AudioDiagnosticsState
-import app.miso.device.AndroidDevice
 import app.miso.device.DeviceConfig
+import app.miso.device.DeviceImpl
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
-    private lateinit var device: AndroidDevice
+    private lateinit var device: DeviceImpl
     private lateinit var statusView: TextView
     private lateinit var routeView: TextView
     private lateinit var counterView: TextView
@@ -38,8 +38,8 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        device = AndroidDevice(
-            context = applicationContext,
+        device = DeviceImpl(
+            platformContext = applicationContext,
             callbacks = this,
             config = DeviceConfig(
                 audio = AudioDiagnosticsConfig(

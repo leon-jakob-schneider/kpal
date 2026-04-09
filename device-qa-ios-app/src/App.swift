@@ -157,7 +157,7 @@ final class AudioQAViewModel: ObservableObject {
         ),
     ]
 
-    private var device: IosDevice
+    private var device: DeviceImpl
     private var currentPreferSpeaker = true
     private let logDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -335,8 +335,9 @@ final class AudioQAViewModel: ObservableObject {
         refreshState()
     }
 
-    private static func makeDevice(preferSpeaker: Bool) -> IosDevice {
-        IosDevice(
+    private static func makeDevice(preferSpeaker: Bool) -> DeviceImpl {
+        DeviceImpl(
+            platformContext: nil,
             callbacks: nil,
             config: DeviceConfig(
                 audio: AudioDiagnosticsConfig(
