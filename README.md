@@ -1,1 +1,1 @@
-<h1><img src="assets/repo-icon.png" alt="kpal icon" width="80" valign="middle" /> kpal</h1>
+![kpal](assets/repo-banner.png)
