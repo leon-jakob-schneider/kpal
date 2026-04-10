@@ -12,8 +12,9 @@ git reset --hard origin/$(git symbolic-ref --short refs/remotes/origin/HEAD | se
 name = "iOS"
 icon = "run"
 command = '''
-[ -f .codex/environments/local.env ] && . .codex/environments/local.env
-DEVICE_ID="${KPAL_IOS_DEVICE_ID:?Set KPAL_IOS_DEVICE_ID in .codex/environments/local.env or your shell environment.}"
+GLOBAL_ENV="${CODEX_HOME:-$HOME/.codex}/environments/kpal.env"
+[ -f "$GLOBAL_ENV" ] && . "$GLOBAL_ENV"
+DEVICE_ID="${KPAL_IOS_DEVICE_ID:?Set KPAL_IOS_DEVICE_ID in $GLOBAL_ENV or your shell environment.}"
 
 xcodebuild \
   -project device-qa-ios-app/module.xcodeproj \
