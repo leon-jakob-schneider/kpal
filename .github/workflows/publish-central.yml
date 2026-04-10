@@ -52,26 +52,7 @@ jobs:
       - name: Normalize Sonatype auth header
         run: |
           SONATYPE_AUTH_BEARER="$(
-            python3 - <<'PY'
-import base64
-import os
-import sys
-
-raw = os.environ.get("SONATYPE_B64", "")
-parts = raw.split(":", 1)
-if len(parts) != 2:
-    print("SONATYPE_B64 must use the format b64username:b64password", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    username = base64.b64decode(parts[0]).decode("utf-8")
-    password = base64.b64decode(parts[1]).decode("utf-8")
-except Exception as exc:
-    print(f"SONATYPE_B64 is not valid base64 username/password data: {exc}", file=sys.stderr)
-    sys.exit(1)
-
-print(base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii"), end="")
-PY
+            ruby -rbase64 -e 'raw = ENV.fetch("SONATYPE_B64", ""); user_b64, pass_b64 = raw.split(":", 2); abort("SONATYPE_B64 must use the format b64username:b64password") if user_b64.nil? || pass_b64.nil? || pass_b64.empty?; user = Base64.strict_decode64(user_b64); pass = Base64.strict_decode64(pass_b64); print Base64.strict_encode64("#{user}:#{pass}")'
           )"
 
           test -n "${SONATYPE_AUTH_BEARER}" || { echo "Failed to build Sonatype auth header"; exit 1; }
