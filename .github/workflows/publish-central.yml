@@ -52,7 +52,7 @@ jobs:
       - name: Normalize Sonatype auth header
         run: |
           SONATYPE_AUTH_BEARER="$(
-            ruby -rbase64 -e 'decode = lambda do |value| normalized = value.delete(" \n\r\t").tr("-_", "+/"); normalized += "=" * ((4 - normalized.length % 4) % 4); Base64.strict_decode64(normalized); end; raw = ENV.fetch("SONATYPE_B64", ""); user_b64, pass_b64 = raw.split(":", 2); abort("SONATYPE_B64 must use the format b64username:b64password") if user_b64.nil? || pass_b64.nil? || pass_b64.empty?; user = decode.call(user_b64); pass = decode.call(pass_b64); print Base64.strict_encode64("#{user}:#{pass}")'
+            ruby -rbase64 -e 'decode = lambda do |value| normalized = value.delete(" \n\r\t").tr("-_", "+/"); normalized += "=" * ((4 - normalized.length % 4) % 4); Base64.strict_decode64(normalized); rescue ArgumentError; nil; end; raw = ENV.fetch("SONATYPE_B64", "").strip; abort("Missing SONATYPE_B64 secret") if raw.empty?; if raw.include?(":"); left, right = raw.split(":", 2); abort("SONATYPE_B64 must not have an empty username or password component") if left.empty? || right.empty?; user = decode.call(left) || left; pass = decode.call(right) || right; else decoded = decode.call(raw); abort("SONATYPE_B64 must be either b64username:b64password, username:password, or base64(username:password)") unless decoded&.include?(":"); user, pass = decoded.split(":", 2); end; print Base64.strict_encode64("#{user}:#{pass}")'
           )"
 
           test -n "${SONATYPE_AUTH_BEARER}" || { echo "Failed to build Sonatype auth header"; exit 1; }
