@@ -3,7 +3,6 @@ package app.miso.audio
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.get
 import kotlinx.cinterop.set
-import platform.AVFAudio.AVAudioConverter
 import platform.AVFAudio.AVAudioEngine
 import platform.AVFAudio.AVAudioFormat
 import platform.AVFAudio.AVAudioPCMBuffer
@@ -62,7 +61,6 @@ class IosAudioDiagnosticsEngine(
     private var audioEngine: AVAudioEngine? = null
     private var playerNode: AVAudioPlayerNode? = null
     private var captureFormat: AVAudioFormat? = null
-    private var captureConverter: AVAudioConverter? = null
     private var running = false
     private var inputLevel = 0f
     private var capturedBytes = 0L
@@ -287,7 +285,6 @@ class IosAudioDiagnosticsEngine(
         val inputFormat = inputNode.outputFormatForBus(0u)
         val hardwareInputFormat = inputNode.inputFormatForBus(0u)
         captureFormat = inputFormat
-        captureConverter = AVAudioConverter(fromFormat = inputFormat, toFormat = captureOutputFormat)
         inputNode.removeTapOnBus(0u)
         inputNode.installTapOnBus(
             bus = 0u,
@@ -353,30 +350,15 @@ class IosAudioDiagnosticsEngine(
                 "First capture callback frameLength=${buffer.frameLength} format=${buffer.format.sampleRate.toInt()}Hz/${buffer.format.channelCount}ch."
             )
         }
-        val converter = captureConverter ?: return
         val inputFormat = captureFormat ?: return
-        val capacity = ceil(
-            buffer.frameLength.toDouble() * captureOutputFormat.sampleRate / inputFormat.sampleRate
-        ).toInt().coerceAtLeast(1)
-        val converted = AVAudioPCMBuffer(captureOutputFormat, capacity.toUInt())
-        val convertedOk = converter.convertToBuffer(converted, fromBuffer = buffer, error = null)
-        if (!convertedOk || converted.frameLength == 0u) {
+        val bytes = convertCapturedBufferToPcm16(buffer, inputFormat)
+        if (bytes == null || bytes.isEmpty()) {
             if (captureCallbacks <= 3 || captureCallbacks % 50L == 0L) {
                 emitLog(
-                    "Capture conversion produced no output callback=$captureCallbacks frameLength=${buffer.frameLength} convertedOk=$convertedOk convertedFrames=${converted.frameLength}."
+                    "Capture conversion produced no output callback=$captureCallbacks frameLength=${buffer.frameLength}."
                 )
             }
             return
-        }
-        val samples = converted.int16ChannelData?.get(0) ?: return
-        val sampleCount = converted.frameLength.toInt()
-        val bytes = ByteArray(sampleCount * 2)
-        var byteIndex = 0
-        for (index in 0 until sampleCount) {
-            val sample = samples[index].toInt()
-            bytes[byteIndex] = (sample and 0xff).toByte()
-            bytes[byteIndex + 1] = ((sample shr 8) and 0xff).toByte()
-            byteIndex += 2
         }
         convertedChunks += 1
         withLock {
@@ -416,6 +398,51 @@ class IosAudioDiagnosticsEngine(
         return sqrt(sumSquares / frameLength.toDouble()).toFloat().coerceIn(0f, 1f)
     }
 
+    private fun convertCapturedBufferToPcm16(buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat): ByteArray? {
+        val inputFrames = buffer.frameLength.toInt()
+        if (inputFrames <= 0) {
+            return null
+        }
+        val outputFrames = ceil(
+            inputFrames.toDouble() * captureOutputFormat.sampleRate / inputFormat.sampleRate
+        ).toInt().coerceAtLeast(1)
+        val bytes = ByteArray(outputFrames * 2)
+        val floatSamples = buffer.floatChannelData?.get(0)
+        if (floatSamples != null) {
+            var byteIndex = 0
+            for (outputIndex in 0 until outputFrames) {
+                val inputIndex = ((outputIndex.toDouble() * inputFormat.sampleRate) / captureOutputFormat.sampleRate)
+                    .toInt()
+                    .coerceIn(0, inputFrames - 1)
+                val sample = (floatSamples[inputIndex].coerceIn(-1f, 1f) * Short.MAX_VALUE.toFloat()).toInt()
+                bytes[byteIndex] = (sample and 0xff).toByte()
+                bytes[byteIndex + 1] = ((sample shr 8) and 0xff).toByte()
+                byteIndex += 2
+            }
+            return bytes
+        }
+        val int16Samples = buffer.int16ChannelData?.get(0)
+        if (int16Samples != null) {
+            var byteIndex = 0
+            for (outputIndex in 0 until outputFrames) {
+                val inputIndex = ((outputIndex.toDouble() * inputFormat.sampleRate) / captureOutputFormat.sampleRate)
+                    .toInt()
+                    .coerceIn(0, inputFrames - 1)
+                val sample = int16Samples[inputIndex].toInt()
+                bytes[byteIndex] = (sample and 0xff).toByte()
+                bytes[byteIndex + 1] = ((sample shr 8) and 0xff).toByte()
+                byteIndex += 2
+            }
+            return bytes
+        }
+        if (captureCallbacks <= 3 || captureCallbacks % 50L == 0L) {
+            emitLog(
+                "Unsupported capture buffer commonFormat=${buffer.format.commonFormat} sampleRate=${inputFormat.sampleRate.toInt()} channels=${inputFormat.channelCount}."
+            )
+        }
+        return null
+    }
+
     private fun cleanupAudioGraph() {
         audioEngine?.inputNode?.removeTapOnBus(0u)
         playerNode?.stop()
@@ -425,7 +452,6 @@ class IosAudioDiagnosticsEngine(
         audioEngine = null
         playerNode = null
         captureFormat = null
-        captureConverter = null
     }
 
     private fun registerSessionObservers() {
