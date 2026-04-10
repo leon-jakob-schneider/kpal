@@ -173,7 +173,7 @@ final class AudioQAViewModel: ObservableObject {
 
     init() {
         device = Self.makeDevice(preferSpeaker: true)
-        appendLog("QA app ready. Use the suite to compare built-in iPhone audio with AirPods and export a report at the end.")
+        appendLog("kpal ready. Use the suite to compare built-in iPhone audio with AirPods and export a report at the end.")
         startPolling()
     }
 
@@ -418,7 +418,7 @@ final class AudioQAViewModel: ObservableObject {
         }.joined(separator: "\n\n")
 
         let summary = """
-        Device Audio QA Report
+        kpal Report
         Generated: \(Date().formatted(date: .numeric, time: .standard))
 
         Suite Size: \(activeTests.count)
@@ -530,7 +530,7 @@ struct AudioQALandingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Text("Device Audio QA")
+                Text("kpal")
                     .font(.system(.largeTitle, design: .rounded).weight(.bold))
                 Text("Choose a full QA suite or run one test in isolation. Each test opens as its own screen and records the user verdict together with diagnostics.")
                     .font(.callout)

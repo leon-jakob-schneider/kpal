@@ -90,7 +90,7 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
             setBackgroundColor(Color.parseColor("#F2EFE7"))
         }
 
-        content.addView(title("Device Audio QA"))
+        content.addView(title("kpal"))
         content.addView(body("Use this app on a real device to validate mic input, speaker output, route changes, and AirPods/Bluetooth behavior before touching the main app."))
 
         statusView = panelText()
