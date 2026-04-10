@@ -34,6 +34,7 @@ data class ModuleSpec(
     val artifactId: String,
     val description: String,
     val namespace: String,
+    val projectDependencies: List<String> = emptyList(),
 )
 
 val moduleSpecs = mapOf(
@@ -46,6 +47,7 @@ val moduleSpecs = mapOf(
         artifactId = "device",
         description = "Shared Kotlin Multiplatform device facade built on top of the audio module.",
         namespace = "app.miso.device",
+        projectDependencies = listOf(":audio"),
     ),
 )
 
@@ -77,6 +79,11 @@ subprojects {
         sourceSets {
             val commonMain by getting {
                 kotlin.srcDir(projectDir.resolve("src"))
+                dependencies {
+                    spec.projectDependencies.forEach { dependencyPath ->
+                        api(project(dependencyPath))
+                    }
+                }
             }
             val androidMain by getting {
                 kotlin.srcDir(projectDir.resolve("src@android"))
@@ -167,6 +174,10 @@ subprojects {
             sign(extensions.getByType<org.gradle.api.publish.PublishingExtension>().publications)
         }
     }
+
+    tasks.matching { it.name.startsWith("publish") && it.name.endsWith("ToStagingRepository") }.configureEach {
+        dependsOn(tasks.matching { task -> task.name.startsWith("sign") && task.name.endsWith("Publication") })
+    }
 }
 
 fun File.hexDigest(algorithm: String): String {
@@ -214,6 +225,7 @@ val verifyCentralSigning = tasks.register("verifyCentralSigning") {
         val unsigned = repoRoot.walkTopDown()
             .filter(File::isFile)
             .filterNot { file ->
+                file.name == "maven-metadata.xml" ||
                 file.name.endsWith(".asc") ||
                     file.name.endsWith(".md5") ||
                     file.name.endsWith(".sha1") ||

@@ -1,0 +1,53 @@
+name: Validate Maven Central Bundle
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version used for bundle validation"
+        required: false
+
+jobs:
+  validate:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v5
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve validation version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="0.0.0-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "RELEASE_VERSION=${VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Validate signing secrets
+        run: |
+          test -n "${GPG_PRIVATE_KEY}" || { echo "Missing GPG_PRIVATE_KEY secret"; exit 1; }
+          test -n "${GPG_PASSPHRASE}" || { echo "Missing GPG_PASSPHRASE secret"; exit 1; }
+
+      - name: Build Central bundle
+        working-directory: publishing
+        run: ./gradlew --no-daemon prepareCentralBundle -PreleaseVersion="${RELEASE_VERSION}"
