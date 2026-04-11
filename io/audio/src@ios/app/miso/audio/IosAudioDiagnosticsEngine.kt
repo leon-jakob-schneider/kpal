@@ -99,10 +99,12 @@ class IosAudioDiagnosticsEngine(
             val inputNode = engine.inputNode
 
             if (config.voiceProcessing && !inputNode.isVoiceProcessingEnabled()) {
-                check(inputNode.setVoiceProcessingEnabled(true, error = null)) {
-                    "setVoiceProcessingEnabled failed."
+                val enabled = inputNode.setVoiceProcessingEnabled(true, error = null)
+                if (enabled) {
+                    emitLog("Enabled AVAudioInputNode voice processing.")
+                } else {
+                    emitLog("Voice processing could not be enabled. Continuing without it.")
                 }
-                emitLog("Enabled AVAudioInputNode voice processing.")
             }
 
             engine.attachNode(player)
@@ -111,8 +113,18 @@ class IosAudioDiagnosticsEngine(
             engine.prepare()
             audioEngine = engine
             playerNode = player
-            installInputTap(inputNode, session, reason = "initial start")
-            startAudioGraph(reason = "initial start")
+            if (!installInputTap(inputNode, session, reason = "initial start")) {
+                running = false
+                cleanupAudioGraph()
+                unregisterSessionObservers()
+                return@runCatching
+            }
+            if (!startAudioGraph(reason = "initial start")) {
+                running = false
+                cleanupAudioGraph()
+                unregisterSessionObservers()
+                return@runCatching
+            }
             running = true
             updateRoute("Started AVAudioEngine full-duplex diagnostics")
         }.onFailure { error ->
@@ -227,23 +239,31 @@ class IosAudioDiagnosticsEngine(
         } else {
             AVAudioSessionCategoryOptionAllowBluetoothHFP
         }
-        check(
-            session.setCategory(
+        if (!session.setCategory(
                 category = AVAudioSessionCategoryPlayAndRecord,
                 mode = AVAudioSessionModeVoiceChat,
                 options = options,
                 error = null,
             )
-        ) { "setCategory failed." }
-        check(session.setPreferredSampleRate(config.sampleRate.toDouble(), error = null)) {
-            "setPreferredSampleRate failed."
+        ) {
+            throw IllegalStateException("setCategory failed.")
         }
-        check(session.setPreferredIOBufferDuration(config.ioBufferFrames.toDouble() / config.sampleRate.toDouble(), error = null)) {
-            "setPreferredIOBufferDuration failed."
+        if (!session.setPreferredSampleRate(config.sampleRate.toDouble(), error = null)) {
+            emitLog("Preferred sample rate request was not applied. Continuing with the system-selected rate.")
         }
-        check(session.setActive(true, error = null)) { "setActive(true) failed." }
+        if (!session.setPreferredIOBufferDuration(config.ioBufferFrames.toDouble() / config.sampleRate.toDouble(), error = null)) {
+            emitLog("Preferred IO buffer duration request was not applied. Continuing with the system-selected duration.")
+        }
+        if (!session.setActive(true, error = null)) {
+            throw IllegalStateException("setActive(true) failed.")
+        }
+        emitLog(
+            "Requested session config preferSpeaker=${config.preferSpeaker} voiceProcessing=${config.voiceProcessing} " +
+                "targetSampleRate=${config.sampleRate}Hz targetIoBuffer=${((config.ioBufferFrames.toDouble() / config.sampleRate.toDouble()) * 1_000.0).toInt()}ms."
+        )
         configurePreferredRoute(session)
         emitLog("Configured AVAudioSession category=playAndRecord mode=voiceChat.")
+        emitLog("Session after config: ${sessionDebugSummary(session)}")
     }
 
     private fun configurePreferredRoute(session: AVAudioSession) {
@@ -251,39 +271,54 @@ class IosAudioDiagnosticsEngine(
         val usesBuiltInAudio = outputs.isEmpty() || outputs.all {
             it.portType == AVAudioSessionPortBuiltInReceiver || it.portType == AVAudioSessionPortBuiltInSpeaker
         }
+        emitLog("Current route before preferred route config: ${sessionDebugSummary(session)}")
         val bluetoothInput = session.availableInputs?.firstOrNull {
             (it as? AVAudioSessionPortDescription)?.portType == AVAudioSessionPortBluetoothHFP
         } as? AVAudioSessionPortDescription
         if (!config.preferSpeaker && bluetoothInput != null) {
-            session.setPreferredInput(bluetoothInput, error = null)
-            session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
-            emitLog("Preferred input set to Bluetooth HFP: ${bluetoothInput.portName}")
-            emitLog("Output override cleared to keep external route active.")
+            val preferredInputApplied = session.setPreferredInput(bluetoothInput, error = null)
+            val outputOverrideCleared = session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
+            emitLog(
+                "Preferred input request for Bluetooth HFP: ${bluetoothInput.portName} applied=$preferredInputApplied"
+            )
+            emitLog("Output override cleared to keep external route active. applied=$outputOverrideCleared")
         } else if (usesBuiltInAudio) {
             val builtInMic = session.availableInputs?.firstOrNull {
                 (it as? AVAudioSessionPortDescription)?.portType == AVAudioSessionPortBuiltInMic
             } as? AVAudioSessionPortDescription
             if (builtInMic != null) {
-                session.setPreferredInput(builtInMic, error = null)
-                emitLog("Preferred input set to built-in mic: ${builtInMic.portName}")
+                val preferredInputApplied = session.setPreferredInput(builtInMic, error = null)
+                emitLog("Preferred input request for built-in mic: ${builtInMic.portName} applied=$preferredInputApplied")
             }
             if (config.preferSpeaker) {
-                session.overrideOutputAudioPort(AVAudioSessionPortOverrideSpeaker, error = null)
-                emitLog("Output overridden to speaker for built-in route.")
+                val outputOverrideApplied = session.overrideOutputAudioPort(AVAudioSessionPortOverrideSpeaker, error = null)
+                emitLog("Output override to speaker for built-in route. applied=$outputOverrideApplied")
             } else {
-                session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
-                emitLog("Output override cleared for built-in route.")
+                val outputOverrideCleared = session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
+                emitLog("Output override cleared for built-in route. applied=$outputOverrideCleared")
             }
         } else {
-            session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
-            emitLog("Output override cleared for external route.")
+            val outputOverrideCleared = session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
+            emitLog("Output override cleared for external route. applied=$outputOverrideCleared")
         }
         emitLog("Available inputs after route config: ${availableInputsSummary(session)}")
+        emitLog("Current route after preferred route config: ${sessionDebugSummary(session)}")
     }
 
-    private fun installInputTap(inputNode: platform.AVFAudio.AVAudioInputNode, session: AVAudioSession, reason: String) {
+    private fun installInputTap(
+        inputNode: platform.AVFAudio.AVAudioInputNode,
+        session: AVAudioSession,
+        reason: String
+    ): Boolean {
         val inputFormat = inputNode.outputFormatForBus(0u)
         val hardwareInputFormat = inputNode.inputFormatForBus(0u)
+        if (inputFormat.channelCount == 0u || inputFormat.sampleRate <= 0.0) {
+            emitError(
+                "Input tap not installed for $reason because the input format is invalid: " +
+                    "${inputFormat.sampleRate.toInt()}Hz/${inputFormat.channelCount}ch."
+            )
+            return false
+        }
         captureFormat = inputFormat
         inputNode.removeTapOnBus(0u)
         inputNode.installTapOnBus(
@@ -304,16 +339,21 @@ class IosAudioDiagnosticsEngine(
         emitLog(
             "Available inputs before engine start: ${availableInputsSummary(session)}"
         )
+        return true
     }
 
-    private fun startAudioGraph(reason: String) {
-        val engine = audioEngine ?: return
-        val player = playerNode ?: return
-        check(engine.startAndReturnError(null)) { "AVAudioEngine start failed during $reason." }
+    private fun startAudioGraph(reason: String): Boolean {
+        val engine = audioEngine ?: return false
+        val player = playerNode ?: return false
+        if (!engine.startAndReturnError(null)) {
+            emitError("AVAudioEngine start failed during $reason.")
+            return false
+        }
         if (!player.isPlaying()) {
             player.play()
         }
         emitLog("Started AVAudioEngine for $reason.")
+        return true
     }
 
     private fun restartAudioGraphAfterRouteChange(reason: String) {
@@ -332,11 +372,26 @@ class IosAudioDiagnosticsEngine(
             player.reset()
             engine.stop()
             configurePreferredRoute(session)
-            installInputTap(engine.inputNode, session, reason)
+            if (!installInputTap(engine.inputNode, session, reason)) {
+                running = false
+                cleanupAudioGraph()
+                unregisterSessionObservers()
+                updateRoute("Audio graph recovery failed")
+                return@runCatching
+            }
             engine.prepare()
-            startAudioGraph(reason)
+            if (!startAudioGraph(reason)) {
+                running = false
+                cleanupAudioGraph()
+                unregisterSessionObservers()
+                updateRoute("Audio graph recovery failed")
+                return@runCatching
+            }
             updateRoute("Restarted audio graph")
         }.onFailure { error ->
+            running = false
+            cleanupAudioGraph()
+            unregisterSessionObservers()
             emitError(error.message ?: "Route change recovery failed.")
         }
         reconfiguringRoute = false
@@ -492,7 +547,9 @@ class IosAudioDiagnosticsEngine(
 
     private fun handleRouteChange(notification: NSNotification?) {
         val userInfoText = notification?.userInfo?.toString() ?: "none"
-        emitLog("AVAudioSession route change notification userInfo=$userInfoText")
+        emitLog(
+            "AVAudioSession route change notification reason=${routeChangeReasonDescription(userInfoText)} userInfo=$userInfoText"
+        )
         if (running) {
             restartAudioGraphAfterRouteChange(userInfoText)
         } else {
@@ -545,6 +602,7 @@ class IosAudioDiagnosticsEngine(
 
     private fun emitError(message: String) {
         lastMessage = message
+        emitLog("ERROR: $message")
         callbacks?.onError(message)
         callbacks?.onStateChanged(currentState())
     }
@@ -558,7 +616,9 @@ class IosAudioDiagnosticsEngine(
         lastRoute = routeSnapshot()
         emitState(message)
         emitLog(
-            "Route: input=${lastRoute?.input} output=${lastRoute?.output} availableInputs=${availableInputsSummary(AVAudioSession.sharedInstance())}"
+            "Route: input=${lastRoute?.input} output=${lastRoute?.output} category=${lastRoute?.category} " +
+                "mode=${lastRoute?.mode} sampleRate=${lastRoute?.sampleRate?.toInt()}Hz " +
+                "ioBuffer=${lastRoute?.ioBufferDurationMillis?.toInt()}ms availableInputs=${availableInputsSummary(AVAudioSession.sharedInstance())}"
         )
     }
 
@@ -568,6 +628,37 @@ class IosAudioDiagnosticsEngine(
             return "none"
         }
         return inputs.joinToString { "${it.portType}=${it.portName}" }
+    }
+
+    private fun sessionDebugSummary(session: AVAudioSession): String {
+        val inputs = session.currentRoute.inputs.mapNotNull { it as? AVAudioSessionPortDescription }
+        val outputs = session.currentRoute.outputs.mapNotNull { it as? AVAudioSessionPortDescription }
+        val inputSummary = inputs.joinToString { "${it.portType}=${it.portName}" }.ifEmpty { "none" }
+        val outputSummary = outputs.joinToString { "${it.portType}=${it.portName}" }.ifEmpty { "none" }
+        return "category=${session.category ?: "unknown"} mode=${session.mode ?: "unknown"} " +
+            "sampleRate=${session.sampleRate.toInt()}Hz ioBuffer=${(session.IOBufferDuration * 1_000.0).toInt()}ms " +
+            "inputs=$inputSummary outputs=$outputSummary"
+    }
+
+    private fun routeChangeReasonDescription(userInfoText: String): String {
+        val code = Regex("AVAudioSessionRouteChangeReasonKey=([0-9]+)")
+            .find(userInfoText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?: return "Unknown"
+        val label = when (code) {
+            0 -> "Unknown"
+            1 -> "NewDeviceAvailable"
+            2 -> "OldDeviceUnavailable"
+            3 -> "CategoryChange"
+            4 -> "Override"
+            6 -> "WakeFromSleep"
+            7 -> "NoSuitableRouteForCategory"
+            8 -> "RouteConfigurationChange"
+            else -> "Reason$code"
+        }
+        return "$label($code)"
     }
 
     private inline fun <T> withLock(block: () -> T): T {

@@ -68,7 +68,15 @@ struct AudioQATestResult {
     let outcome: AudioQATestOutcome
     let recordedAt: Date
     let stateSummary: String
+    let timeline: [String]
+    let scopedLogs: [String]
     let recentLogs: [String]
+}
+
+private struct AudioQATestContext {
+    let testId: String
+    let logStartIndex: Int
+    var timeline: [String]
 }
 
 enum AudioQAScreen {
@@ -85,6 +93,23 @@ struct SharePayload: Identifiable {
 struct AlertMessage: Identifiable {
     let id = UUID()
     let text: String
+}
+
+private enum AudioQAStepKind {
+    case confirmBuiltInRoute
+    case confirmAirPodsRoute
+    case captureSpeech
+    case playTone
+    case playCapturedAudio
+    case verdict
+}
+
+private struct AudioQAStepDefinition: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+    let actionTitle: String?
+    let kind: AudioQAStepKind
 }
 
 @MainActor
@@ -164,12 +189,20 @@ final class AudioQAViewModel: ObservableObject {
         formatter.dateFormat = "HH:mm:ss.SSS"
         return formatter
     }()
+    private let eventDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
     private let fileDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         return formatter
     }()
     private var pollTask: Task<Void, Never>?
+    private var reportLogLines: [String] = []
+    private var currentTestContext: AudioQATestContext?
+    private var peakInputLevelSinceCaptureReset: Float = 0
 
     init() {
         device = Self.makeDevice(preferSpeaker: true)
@@ -195,18 +228,26 @@ final class AudioQAViewModel: ObservableObject {
     }
 
     func prepareForTest(_ test: AudioQATestDefinition) async -> Bool {
+        beginTestContextIfNeeded(for: test)
+        recordTestEvent(
+            for: test,
+            "Preparing audio session. kind=\(test.kind.rawValue) preferSpeaker=\(shouldPreferSpeaker(for: test))"
+        )
         let preferSpeaker = shouldPreferSpeaker(for: test)
         if preferSpeaker != currentPreferSpeaker {
             replaceEngine(preferSpeaker: preferSpeaker, reason: "Switching route policy for \(test.title)")
         } else if state.isRunning {
+            recordTestEvent(for: test, "Audio session already running. Restarting before test.")
             stopSession()
         }
         let ready = await ensureSessionReady()
         guard ready else {
+            recordTestEvent(for: test, "Audio session failed to start.", includeSnapshot: true)
             return false
         }
+        recordTestEvent(for: test, "Audio session ready.", includeSnapshot: true)
         if test.kind == .capturedLoopback {
-            clearCapture()
+            clearCapture(for: test)
             appendLog("Cleared capture buffer for \(test.title).")
         }
         return true
@@ -233,6 +274,7 @@ final class AudioQAViewModel: ObservableObject {
             return false
         }
 
+        appendLog("Microphone permission granted.")
         device.audio.start()
         drainLogs()
         refreshState()
@@ -243,42 +285,106 @@ final class AudioQAViewModel: ObservableObject {
         device.audio.stop()
         drainLogs()
         refreshState()
+        peakInputLevelSinceCaptureReset = 0
     }
 
-    func clearCapture() {
+    func clearCapture(for test: AudioQATestDefinition? = nil) {
         device.audio.clearCapture()
         drainLogs()
         refreshState()
+        peakInputLevelSinceCaptureReset = 0
+        if let test {
+            recordTestEvent(for: test, "Cleared capture buffer.", includeSnapshot: true)
+        }
     }
 
-    func playTestTone() {
+    func playTestTone(for test: AudioQATestDefinition? = nil) {
+        if let test {
+            recordTestEvent(for: test, "Requested 440 Hz playback.", includeSnapshot: true)
+        }
         device.audio.playTestTone()
         drainLogs()
         refreshState()
+        if let test {
+            recordTestEvent(for: test, "Playback request finished.", includeSnapshot: true)
+        }
     }
 
-    func playCapturedAudio() {
+    func playCapturedAudio(for test: AudioQATestDefinition? = nil) {
+        if let test {
+            recordTestEvent(for: test, "Requested captured audio playback.", includeSnapshot: true)
+        }
         device.audio.playCapturedAudio()
         drainLogs()
         refreshState()
+        if let test {
+            recordTestEvent(for: test, "Captured audio playback request finished.", includeSnapshot: true)
+        }
     }
 
     func result(for test: AudioQATestDefinition) -> AudioQATestResult? {
         results[test.id]
     }
 
+    func verifyEnvironment(for test: AudioQATestDefinition) async -> String? {
+        let ready = await prepareForTest(test)
+        guard ready else {
+            return "Audio setup failed. Check microphone permission and try again."
+        }
+        let routeMatched = await waitForExpectedRoute(for: test)
+        guard routeMatched else {
+            if shouldPreferSpeaker(for: test) {
+                return "The phone is still not using its built-in audio route. Disconnect external audio devices and try again."
+            }
+            return "AirPods are not active yet. Connect them, wear them, and select them as the audio route, then try again."
+        }
+        return nil
+    }
+
+    func verifySpeechCapture(for test: AudioQATestDefinition) async -> String? {
+        let routeMatched = await waitForExpectedRoute(for: test)
+        guard routeMatched else {
+            if shouldPreferSpeaker(for: test) {
+                return "The phone audio route changed away from the built-in mic or speaker. Go back and prepare the test again."
+            }
+            return "AirPods are no longer the active route. Reconnect them and try again."
+        }
+
+        if capturedSpeechLooksValid {
+            return nil
+        }
+
+        return "We could not detect a clear voice recording. Speak for a few seconds and try again."
+    }
+
+    func verifyActiveRoute(for test: AudioQATestDefinition) async -> String? {
+        let routeMatched = await waitForExpectedRoute(for: test)
+        guard routeMatched else {
+            if shouldPreferSpeaker(for: test) {
+                return "The phone is no longer using its built-in audio route. Go back and prepare the test again."
+            }
+            return "AirPods are no longer the active audio route. Reconnect them and try again."
+        }
+        return nil
+    }
+
     func recordResult(for test: AudioQATestDefinition, outcome: AudioQATestOutcome) {
         refreshState()
+        let timeline = finalizedTimeline(for: test, outcome: outcome)
+        let scopedLogs = scopedLogs(for: test)
         let result = AudioQATestResult(
             testId: test.id,
             title: test.title,
             outcome: outcome,
             recordedAt: Date(),
             stateSummary: diagnosticSnapshotText(),
+            timeline: timeline,
+            scopedLogs: scopedLogs,
             recentLogs: Array(logLines.prefix(40).reversed())
         )
         results[test.id] = result
         appendLog("Recorded QA result for \(test.title): \(outcome.rawValue).")
+        currentTestContext = nil
     }
 
     func reportURL() throws -> URL {
@@ -321,6 +427,9 @@ final class AudioQAViewModel: ObservableObject {
         stopSession()
         activeTests = []
         results = [:]
+        currentTestContext = nil
+        reportLogLines = []
+        peakInputLevelSinceCaptureReset = 0
     }
 
     private func shouldPreferSpeaker(for test: AudioQATestDefinition) -> Bool {
@@ -371,6 +480,7 @@ final class AudioQAViewModel: ObservableObject {
             builtInAudioActive: route?.builtInAudioActive ?? false,
             lastMessage: stateValue.lastMessage
         )
+        peakInputLevelSinceCaptureReset = max(peakInputLevelSinceCaptureReset, state.inputLevel)
     }
 
     private func drainLogs() {
@@ -380,10 +490,83 @@ final class AudioQAViewModel: ObservableObject {
     }
 
     private func appendLog(_ message: String) {
-        logLines.insert("\(logDateFormatter.string(from: Date())) \(message)", at: 0)
+        let line = "\(logDateFormatter.string(from: Date())) \(message)"
+        logLines.insert(line, at: 0)
         if logLines.count > 200 {
             logLines.removeLast(logLines.count - 200)
         }
+        reportLogLines.append(line)
+    }
+
+    private func beginTestContextIfNeeded(for test: AudioQATestDefinition) {
+        guard currentTestContext?.testId != test.id else {
+            return
+        }
+        currentTestContext = AudioQATestContext(
+            testId: test.id,
+            logStartIndex: reportLogLines.count,
+            timeline: []
+        )
+        recordTestEvent(for: test, "Entered test screen.", includeSnapshot: true)
+    }
+
+    private func recordTestEvent(
+        for test: AudioQATestDefinition,
+        _ message: String,
+        includeSnapshot: Bool = false
+    ) {
+        beginTestContextIfNeeded(for: test)
+        guard var context = currentTestContext, context.testId == test.id else {
+            return
+        }
+        let snapshotSuffix = includeSnapshot ? " | \(compactDiagnosticSummary())" : ""
+        context.timeline.append("[\(eventDateFormatter.string(from: Date()))] \(message)\(snapshotSuffix)")
+        currentTestContext = context
+    }
+
+    private func compactDiagnosticSummary() -> String {
+        "running=\(state.isRunning) input=\(state.inputRoute) output=\(state.outputRoute) sampleRate=\(Int(state.sampleRate))Hz ioBuffer=\(String(format: "%.2f", state.ioBufferMillis))ms inputLevel=\(String(format: "%.3f", state.inputLevel)) capturedBytes=\(state.capturedBytes) playedBytes=\(state.playedBytes) playbackRequests=\(state.playbackRequests)"
+    }
+
+    private func finalizedTimeline(for test: AudioQATestDefinition, outcome: AudioQATestOutcome) -> [String] {
+        beginTestContextIfNeeded(for: test)
+        recordTestEvent(for: test, "Recorded verdict: \(outcome.rawValue).", includeSnapshot: true)
+        return currentTestContext?.timeline ?? []
+    }
+
+    private func scopedLogs(for test: AudioQATestDefinition) -> [String] {
+        guard let context = currentTestContext, context.testId == test.id else {
+            return []
+        }
+        guard context.logStartIndex < reportLogLines.count else {
+            return []
+        }
+        return Array(reportLogLines[context.logStartIndex...])
+    }
+
+    private func waitForExpectedRoute(for test: AudioQATestDefinition) async -> Bool {
+        for _ in 0..<12 {
+            drainLogs()
+            refreshState()
+            if routeMatchesExpectation(for: test) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        drainLogs()
+        refreshState()
+        return routeMatchesExpectation(for: test)
+    }
+
+    private func routeMatchesExpectation(for test: AudioQATestDefinition) -> Bool {
+        if shouldPreferSpeaker(for: test) {
+            return state.builtInAudioActive && !state.bluetoothActive
+        }
+        return state.bluetoothActive && (state.inputRoute.contains("Bluetooth") || state.outputRoute.contains("Bluetooth"))
+    }
+
+    private var capturedSpeechLooksValid: Bool {
+        state.capturedBytes >= 48_000 && peakInputLevelSinceCaptureReset >= 0.015
     }
 
     private func diagnosticSnapshotText() -> String {
@@ -412,6 +595,10 @@ final class AudioQAViewModel: ObservableObject {
             Recorded At: \(result.recordedAt.formatted(date: .numeric, time: .standard))
             Snapshot:
             \(result.stateSummary)
+            Timeline:
+            \(result.timeline.isEmpty ? "No test timeline events recorded." : result.timeline.joined(separator: "\n"))
+            Logs During Test:
+            \(result.scopedLogs.isEmpty ? "No scoped logs recorded." : result.scopedLogs.joined(separator: "\n"))
             Recent Logs:
             \(result.recentLogs.joined(separator: "\n"))
             """
@@ -431,7 +618,7 @@ final class AudioQAViewModel: ObservableObject {
         \(diagnosticSnapshotText())
         """
 
-        let allLogs = logLines.reversed().joined(separator: "\n")
+        let allLogs = reportLogLines.joined(separator: "\n")
         return """
         \(summary)
 
@@ -462,7 +649,7 @@ struct AudioQAAppView: View {
             switch screen {
             case .landing:
                 AudioQALandingView(
-                    viewModel: viewModel,
+                    tests: viewModel.tests,
                     startSuite: {
                         viewModel.beginSuite()
                         screen = .test(index: 0, suite: true)
@@ -479,7 +666,6 @@ struct AudioQAAppView: View {
                         viewModel: viewModel,
                         test: viewModel.activeTests[index],
                         stepText: suite ? "Test \(index + 1) of \(viewModel.activeTests.count)" : "Single Test",
-                        suite: suite,
                         exitRun: {
                             viewModel.stopSession()
                             screen = .landing
@@ -523,7 +709,7 @@ struct AudioQAAppView: View {
 }
 
 struct AudioQALandingView: View {
-    @ObservedObject var viewModel: AudioQAViewModel
+    let tests: [AudioQATestDefinition]
     let startSuite: () -> Void
     let startSingle: (AudioQATestDefinition) -> Void
 
@@ -551,7 +737,7 @@ struct AudioQALandingView: View {
                 Text("Single Test")
                     .font(.title3.weight(.semibold))
 
-                ForEach(viewModel.tests) { test in
+                ForEach(tests) { test in
                     qaCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Text(test.title)
@@ -566,24 +752,6 @@ struct AudioQALandingView: View {
                         }
                     }
                 }
-
-                qaCard {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Live Diagnostics")
-                            .font(.headline)
-                        Text(verbatim: """
-        running: \(viewModel.state.isRunning)
-        last: \(viewModel.state.lastMessage)
-        inputLevel: \(String(format: "%.3f", viewModel.state.inputLevel))
-        captureCallbacks: \(viewModel.state.captureCallbacks)
-        convertedChunks: \(viewModel.state.convertedChunks)
-        playbackRequests: \(viewModel.state.playbackRequests)
-        """)
-                        .font(.system(.caption, design: .monospaced))
-                        Text(viewModel.state.routeSummary)
-                            .font(.system(.caption, design: .monospaced))
-                    }
-                }
             }
             .padding(20)
         }
@@ -594,37 +762,31 @@ struct AudioQATestView: View {
     @ObservedObject var viewModel: AudioQAViewModel
     let test: AudioQATestDefinition
     let stepText: String
-    let suite: Bool
     let exitRun: () -> Void
     let advance: () -> Void
 
-    @State private var didPerformPrimaryAction = false
-    @State private var alertMessage: AlertMessage?
+    @State private var currentStepIndex = 0
+    @State private var isWorking = false
+    @State private var stepMessage: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header
-                instructionsCard
-                controlsCard
-                diagnosticsCard("Status", text: statusText)
-                levelCard
-                diagnosticsCard("Route", text: viewModel.state.routeSummary)
-                diagnosticsCard("Session", text: viewModel.state.sessionSummary)
-                verdictCard
-                diagnosticsCard("Recent Log", text: recentLogText)
+                currentStepCard
             }
             .padding(20)
         }
         .task(id: test.id) {
-            didPerformPrimaryAction = false
-            let ready = await viewModel.prepareForTest(test)
-            if !ready {
-                alertMessage = AlertMessage(text: "Microphone access or audio session setup failed. Check permission state and try again.")
-            }
+            currentStepIndex = 0
+            isWorking = false
+            stepMessage = nil
+            await enterCurrentStep()
         }
-        .alert(item: $alertMessage) { item in
-            Alert(title: Text("Audio Setup"), message: Text(item.text), dismissButton: .default(Text("OK")))
+        .onChange(of: currentStepIndex) { _, _ in
+            Task {
+                await enterCurrentStep()
+            }
         }
     }
 
@@ -645,7 +807,7 @@ struct AudioQATestView: View {
                     }
                     .buttonStyle(.bordered)
                     Spacer()
-                    Text(test.kind.rawValue)
+                    Text("Step \(currentStepIndex + 1) of \(steps.count)")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
@@ -655,90 +817,38 @@ struct AudioQATestView: View {
         }
     }
 
-    private var instructionsCard: some View {
+    private var currentStepCard: some View {
         qaCard {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Instructions")
-                    .font(.headline)
-                ForEach(Array(test.instructions.enumerated()), id: \.offset) { offset, instruction in
-                    Text("\(offset + 1). \(instruction)")
-                        .font(.callout)
+            VStack(alignment: .leading, spacing: 14) {
+                Text(currentStep.title)
+                    .font(.title3.weight(.semibold))
+                Text(currentStep.detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                if let stepMessage {
+                    Text(stepMessage)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+
+                if isWorking {
+                    ProgressView()
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-            }
-        }
-    }
 
-    private var controlsCard: some View {
-        qaCard {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Actions")
-                    .font(.headline)
-                Button(viewModel.state.isRunning ? "Audio Session Ready" : "Prepare Audio Session") {
-                    Task {
-                        let ready = await viewModel.prepareForTest(test)
-                        if !ready {
-                            alertMessage = AlertMessage(text: "Microphone access or audio session setup failed. Check permission state and try again.")
-                        }
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isPreparingSession || viewModel.state.isRunning)
-
-                if test.kind == .capturedLoopback {
-                    Button("Clear Capture Buffer") {
-                        viewModel.clearCapture()
-                    }
-                    .buttonStyle(.bordered)
-                }
-
-                Button(test.actionTitle) {
-                    runPrimaryAction()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.state.isRunning)
-
-                if test.kind == .capturedLoopback {
-                    Text("After clearing the capture buffer, speak for a few seconds before tapping playback.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-
-    private var verdictCard: some View {
-        qaCard {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Reaction")
-                    .font(.headline)
-                if let result = viewModel.result(for: test) {
-                    Text("Result: \(result.outcome.rawValue)")
-                        .font(.title3.weight(.semibold))
-                    Text("Recorded at \(result.recordedAt.formatted(date: .omitted, time: .standard))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button(suite ? nextButtonTitle : "View Report") {
-                        advance()
+                switch currentStep.kind {
+                case .verdict:
+                    verdictButtons
+                default:
+                    Button(currentStep.actionTitle ?? "Continue") {
+                        runCurrentStepAction()
                     }
                     .buttonStyle(.borderedProminent)
-                } else {
-                    Text("Run the audio action first, then capture the user verdict.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Button(test.passTitle) {
-                        viewModel.recordResult(for: test, outcome: .passed)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!didPerformPrimaryAction)
-                    Button(test.failTitle) {
-                        viewModel.recordResult(for: test, outcome: .failed)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                    .disabled(!didPerformPrimaryAction)
-                    Button("Skip This Test") {
-                        viewModel.recordResult(for: test, outcome: .skipped)
+                    .disabled(isWorking)
+
+                    Button("Abort Test") {
+                        skipTest()
                     }
                     .buttonStyle(.bordered)
                 }
@@ -746,52 +856,152 @@ struct AudioQATestView: View {
         }
     }
 
-    private var levelCard: some View {
-        qaCard {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Live Mic Level")
-                    .font(.headline)
-                ProgressView(value: Double(viewModel.state.inputLevel))
-                    .progressViewStyle(.linear)
-                Text("If this stays near 0 while you are speaking, input capture or route selection is likely broken.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    private var verdictButtons: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Did this step work as expected?")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Button(test.passTitle) {
+                viewModel.recordResult(for: test, outcome: .passed)
+                advance()
             }
+            .buttonStyle(.borderedProminent)
+            Button(test.failTitle) {
+                viewModel.recordResult(for: test, outcome: .failed)
+                advance()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            Button("Abort Test") {
+                skipTest()
+            }
+            .buttonStyle(.bordered)
         }
     }
 
-    private var statusText: String {
-        """
-        running: \(viewModel.state.isRunning)
-        last: \(viewModel.state.lastMessage)
-        capturedBytes: \(viewModel.state.capturedBytes)
-        playedBytes: \(viewModel.state.playedBytes)
-        captureCallbacks: \(viewModel.state.captureCallbacks)
-        convertedChunks: \(viewModel.state.convertedChunks)
-        playbackRequests: \(viewModel.state.playbackRequests)
-        inputLevel: \(String(format: "%.3f", viewModel.state.inputLevel))
-        """
-    }
+    private var steps: [AudioQAStepDefinition] {
+        let routeStep = expectsAirPods
+            ? AudioQAStepDefinition(
+                id: "confirm-airpods",
+                title: "Connect AirPods",
+                detail: "Connect your AirPods, put them in your ears, then confirm. The app will verify that AirPods are really available before continuing.",
+                actionTitle: "AirPods Are Connected",
+                kind: .confirmAirPodsRoute
+            )
+            : AudioQAStepDefinition(
+                id: "confirm-built-in",
+                title: "Use iPhone Audio",
+                detail: "Disconnect AirPods and any other external audio devices, then confirm. The app will verify that the phone is using its own audio route.",
+                actionTitle: "Use iPhone Audio",
+                kind: .confirmBuiltInRoute
+            )
 
-    private var recentLogText: String {
-        let lines = Array(viewModel.logLines.prefix(16))
-        return lines.isEmpty ? "No log lines yet." : lines.joined(separator: "\n")
-    }
-
-    private var nextButtonTitle: String {
-        let currentIndex = viewModel.activeTests.firstIndex(of: test) ?? 0
-        let hasNext = currentIndex + 1 < viewModel.activeTests.count
-        return hasNext ? "Continue to Next Test" : "Finish Suite"
-    }
-
-    private func runPrimaryAction() {
         switch test.kind {
         case .tonePlayback:
-            viewModel.playTestTone()
+            return [
+                routeStep,
+                AudioQAStepDefinition(
+                    id: "play-tone",
+                    title: "Play the Test Tone",
+                    detail: "Tap the button below and listen for the 440 Hz tone on the expected output device.",
+                    actionTitle: "Play 440 Hz Tone",
+                    kind: .playTone
+                ),
+                AudioQAStepDefinition(
+                    id: "verdict",
+                    title: "Confirm the Result",
+                    detail: "Record whether you heard the tone on the expected output device.",
+                    actionTitle: nil,
+                    kind: .verdict
+                )
+            ]
         case .capturedLoopback:
-            viewModel.playCapturedAudio()
+            return [
+                routeStep,
+                AudioQAStepDefinition(
+                    id: "capture-speech",
+                    title: "Record Your Voice",
+                    detail: "Speak a short sentence for three to five seconds, then confirm. The app will check that it captured a usable recording before continuing.",
+                    actionTitle: "I Finished Speaking",
+                    kind: .captureSpeech
+                ),
+                AudioQAStepDefinition(
+                    id: "play-capture",
+                    title: "Play the Recording",
+                    detail: "Tap the button below to play the captured voice on the expected output device.",
+                    actionTitle: "Play Recorded Voice",
+                    kind: .playCapturedAudio
+                ),
+                AudioQAStepDefinition(
+                    id: "verdict",
+                    title: "Confirm the Result",
+                    detail: "Record whether you heard the recorded voice on the expected output device.",
+                    actionTitle: nil,
+                    kind: .verdict
+                )
+            ]
         }
-        didPerformPrimaryAction = true
+    }
+
+    private var expectsAirPods: Bool {
+        test.id.contains("airpods")
+    }
+
+    private var currentStep: AudioQAStepDefinition {
+        steps[currentStepIndex]
+    }
+
+    private func enterCurrentStep() async {
+        stepMessage = nil
+        if currentStep.kind == .captureSpeech {
+            viewModel.clearCapture(for: test)
+        }
+    }
+
+    private func runCurrentStepAction() {
+        Task {
+            isWorking = true
+            stepMessage = nil
+            defer {
+                isWorking = false
+            }
+
+            switch currentStep.kind {
+            case .confirmBuiltInRoute, .confirmAirPodsRoute:
+                if let message = await viewModel.verifyEnvironment(for: test) {
+                    stepMessage = message
+                } else {
+                    currentStepIndex += 1
+                }
+            case .captureSpeech:
+                if let message = await viewModel.verifySpeechCapture(for: test) {
+                    stepMessage = message
+                } else {
+                    currentStepIndex += 1
+                }
+            case .playTone:
+                if let message = await viewModel.verifyActiveRoute(for: test) {
+                    stepMessage = message
+                    return
+                }
+                viewModel.playTestTone(for: test)
+                currentStepIndex += 1
+            case .playCapturedAudio:
+                if let message = await viewModel.verifyActiveRoute(for: test) {
+                    stepMessage = message
+                    return
+                }
+                viewModel.playCapturedAudio(for: test)
+                currentStepIndex += 1
+            case .verdict:
+                break
+            }
+        }
+    }
+
+    private func skipTest() {
+        viewModel.recordResult(for: test, outcome: .skipped)
+        advance()
     }
 }
 
@@ -829,27 +1039,11 @@ struct AudioQAResultsView: View {
                             if let result = viewModel.result(for: test) {
                                 Text("Outcome: \(result.outcome.rawValue)")
                                     .font(.subheadline.weight(.semibold))
-                                Text(result.stateSummary)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
                             } else {
                                 Text("No result recorded.")
                                     .foregroundStyle(.secondary)
                             }
                         }
-                    }
-                }
-
-                qaCard {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Final Diagnostics")
-                            .font(.headline)
-                        Text(viewModel.state.routeSummary)
-                            .font(.system(.caption, design: .monospaced))
-                        Text(viewModel.state.sessionSummary)
-                            .font(.system(.caption, design: .monospaced))
-                        Text("last: \(viewModel.state.lastMessage)")
-                            .font(.system(.caption, design: .monospaced))
                     }
                 }
 

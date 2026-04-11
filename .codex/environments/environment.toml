@@ -14,3 +14,10 @@ icon = "run"
 command = '''
 "$PWD/scripts/run-iphone.sh"
 '''
+
+[[actions]]
+name = "iOS Debug"
+icon = "run"
+command = '''
+"$PWD/scripts/debug-iphone.sh" --skip-build --continue
+'''
