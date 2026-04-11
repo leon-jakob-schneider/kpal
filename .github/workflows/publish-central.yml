@@ -1,0 +1,77 @@
+name: Publish To Maven Central
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to publish"
+        required: true
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      SONATYPE_B64: ${{ secrets.SONATYPE_B64 }}
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v5
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve release version
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "RELEASE_VERSION=${VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Validate publishing secrets
+        run: |
+          test -n "${SONATYPE_B64}" || { echo "Missing SONATYPE_B64 secret"; exit 1; }
+          test -n "${GPG_PRIVATE_KEY}" || { echo "Missing GPG_PRIVATE_KEY secret"; exit 1; }
+          test -n "${GPG_PASSPHRASE}" || { echo "Missing GPG_PASSPHRASE secret"; exit 1; }
+
+      - name: Normalize Sonatype auth header
+        run: |
+          SONATYPE_AUTH_BEARER="$(
+            ruby -rbase64 -e 'decode = lambda do |value| normalized = value.delete(" \n\r\t").tr("-_", "+/"); normalized += "=" * ((4 - normalized.length % 4) % 4); decoded = Base64.strict_decode64(normalized).dup.force_encoding(Encoding::UTF_8); next nil unless decoded.valid_encoding?; next nil unless decoded.match?(/\A[\p{Print}\s]+\z/); decoded; rescue ArgumentError; nil; end; raw = ENV.fetch("SONATYPE_B64", "").strip; abort("Missing SONATYPE_B64 secret") if raw.empty?; if raw.include?(":"); left, right = raw.split(":", 2); abort("SONATYPE_B64 must not have an empty username or password component") if left.empty? || right.empty?; user = decode.call(left) || left; pass = decode.call(right) || right; else decoded = decode.call(raw); abort("SONATYPE_B64 must be either b64username:b64password, username:password, or base64(username:password)") unless decoded&.include?(":"); user, pass = decoded.split(":", 2); end; print Base64.strict_encode64("#{user}:#{pass}")'
+          )"
+
+          test -n "${SONATYPE_AUTH_BEARER}" || { echo "Failed to build Sonatype auth header"; exit 1; }
+          echo "SONATYPE_AUTH_BEARER=${SONATYPE_AUTH_BEARER}" >> "${GITHUB_ENV}"
+
+      - name: Build Central bundle
+        working-directory: publishing
+        run: ./gradlew --no-daemon prepareCentralBundle -PreleaseVersion="${RELEASE_VERSION}"
+
+      - name: Upload Central bundle
+        working-directory: publishing
+        run: |
+          DEPLOYMENT_ID="$(
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer ${SONATYPE_AUTH_BEARER}" \
+              --form bundle=@build/central-bundle/central-bundle.zip \
+              "https://central.sonatype.com/api/v1/publisher/upload?name=kpal-${RELEASE_VERSION}&publishingType=AUTOMATIC"
+          )"
+
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "${GITHUB_ENV}"
+          echo "Uploaded Central bundle as deployment ${DEPLOYMENT_ID}"
