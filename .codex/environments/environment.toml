@@ -12,5 +12,12 @@ git reset --hard origin/$(git symbolic-ref --short refs/remotes/origin/HEAD | se
 name = "iOS"
 icon = "run"
 command = '''
+"$PWD/scripts/run-iphone.sh"
+'''
+
+[[actions]]
+name = "iOS Debug"
+icon = "run"
+command = '''
 "$PWD/scripts/debug-iphone.sh" --skip-build --continue
 '''
