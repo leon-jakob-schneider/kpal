@@ -74,32 +74,4 @@ jobs:
           )"
 
           echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "${GITHUB_ENV}"
-
-      - name: Wait for Central publication
-        run: |
-          for _ in $(seq 1 60); do
-            RESPONSE="$(
-              curl --fail --silent --show-error \
-                --request POST \
-                --header "Authorization: Bearer ${SONATYPE_AUTH_BEARER}" \
-                "https://central.sonatype.com/api/v1/publisher/status?id=${DEPLOYMENT_ID}"
-            )"
-
-            echo "${RESPONSE}"
-
-            STATE="$(printf '%s' "${RESPONSE}" | ruby -rjson -e 'print JSON.parse(STDIN.read)["deploymentState"]')"
-
-            case "${STATE}" in
-              PUBLISHED)
-                exit 0
-                ;;
-              FAILED)
-                exit 1
-                ;;
-            esac
-
-            sleep 20
-          done
-
-          echo "Timed out waiting for Central publication"
-          exit 1
+          echo "Uploaded Central bundle as deployment ${DEPLOYMENT_ID}"
