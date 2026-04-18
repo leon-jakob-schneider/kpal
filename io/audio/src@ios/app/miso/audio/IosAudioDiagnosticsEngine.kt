@@ -10,8 +10,10 @@ import platform.AVFAudio.AVAudioSession
 import platform.AVFAudio.AVAudioPlayerNode
 import platform.AVFAudio.AVAudioSessionCategoryOptionAllowBluetoothHFP
 import platform.AVFAudio.AVAudioSessionCategoryOptionDefaultToSpeaker
+import platform.AVFAudio.AVAudioSessionCategoryPlayback
 import platform.AVFAudio.AVAudioSessionCategoryPlayAndRecord
 import platform.AVFAudio.AVAudioSessionInterruptionNotification
+import platform.AVFAudio.AVAudioSessionModeDefault
 import platform.AVFAudio.AVAudioSessionModeVoiceChat
 import platform.AVFAudio.AVAudioSessionPortBluetoothA2DP
 import platform.AVFAudio.AVAudioSessionPortBluetoothHFP
@@ -96,14 +98,16 @@ class IosAudioDiagnosticsEngine(
 
             val engine = AVAudioEngine()
             val player = AVAudioPlayerNode()
-            val inputNode = engine.inputNode
 
-            if (config.voiceProcessing && !inputNode.isVoiceProcessingEnabled()) {
-                val enabled = inputNode.setVoiceProcessingEnabled(true, error = null)
-                if (enabled) {
-                    emitLog("Enabled AVAudioInputNode voice processing.")
-                } else {
-                    emitLog("Voice processing could not be enabled. Continuing without it.")
+            if (config.enableInput) {
+                val inputNode = engine.inputNode
+                if (config.voiceProcessing && !inputNode.isVoiceProcessingEnabled()) {
+                    val enabled = inputNode.setVoiceProcessingEnabled(true, error = null)
+                    if (enabled) {
+                        emitLog("Enabled AVAudioInputNode voice processing.")
+                    } else {
+                        emitLog("Voice processing could not be enabled. Continuing without it.")
+                    }
                 }
             }
 
@@ -113,11 +117,13 @@ class IosAudioDiagnosticsEngine(
             engine.prepare()
             audioEngine = engine
             playerNode = player
-            if (!installInputTap(inputNode, session, reason = "initial start")) {
-                running = false
-                cleanupAudioGraph()
-                unregisterSessionObservers()
-                return@runCatching
+            if (config.enableInput) {
+                if (!installInputTap(engine.inputNode, session, reason = "initial start")) {
+                    running = false
+                    cleanupAudioGraph()
+                    unregisterSessionObservers()
+                    return@runCatching
+                }
             }
             if (!startAudioGraph(reason = "initial start")) {
                 running = false
@@ -234,14 +240,24 @@ class IosAudioDiagnosticsEngine(
     }
 
     private fun configureAudioSession(session: AVAudioSession) {
-        val options = if (config.preferSpeaker) {
-            AVAudioSessionCategoryOptionDefaultToSpeaker or AVAudioSessionCategoryOptionAllowBluetoothHFP
+        val category: String?
+        val mode: String?
+        val options: ULong = if (config.preferBluetoothA2dpOutput) {
+            category = AVAudioSessionCategoryPlayback
+            mode = AVAudioSessionModeDefault
+            0u
         } else {
-            AVAudioSessionCategoryOptionAllowBluetoothHFP
+            category = AVAudioSessionCategoryPlayAndRecord
+            mode = AVAudioSessionModeVoiceChat
+            if (config.preferSpeaker) {
+                AVAudioSessionCategoryOptionDefaultToSpeaker or AVAudioSessionCategoryOptionAllowBluetoothHFP
+            } else {
+                AVAudioSessionCategoryOptionAllowBluetoothHFP
+            }
         }
         if (!session.setCategory(
-                category = AVAudioSessionCategoryPlayAndRecord,
-                mode = AVAudioSessionModeVoiceChat,
+                category = category,
+                mode = mode,
                 options = options,
                 error = null,
             )
@@ -259,10 +275,11 @@ class IosAudioDiagnosticsEngine(
         }
         emitLog(
             "Requested session config preferSpeaker=${config.preferSpeaker} voiceProcessing=${config.voiceProcessing} " +
+                "enableInput=${config.enableInput} preferBluetoothA2dpOutput=${config.preferBluetoothA2dpOutput} " +
                 "targetSampleRate=${config.sampleRate}Hz targetIoBuffer=${((config.ioBufferFrames.toDouble() / config.sampleRate.toDouble()) * 1_000.0).toInt()}ms."
         )
         configurePreferredRoute(session)
-        emitLog("Configured AVAudioSession category=playAndRecord mode=voiceChat.")
+        emitLog("Configured AVAudioSession category=$category mode=$mode.")
         emitLog("Session after config: ${sessionDebugSummary(session)}")
     }
 
@@ -275,7 +292,12 @@ class IosAudioDiagnosticsEngine(
         val bluetoothInput = session.availableInputs?.firstOrNull {
             (it as? AVAudioSessionPortDescription)?.portType == AVAudioSessionPortBluetoothHFP
         } as? AVAudioSessionPortDescription
-        if (!config.preferSpeaker && bluetoothInput != null) {
+        if (config.preferBluetoothA2dpOutput) {
+            val preferredInputCleared = session.setPreferredInput(null, error = null)
+            val outputOverrideCleared = session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
+            emitLog("Cleared preferred input to allow Bluetooth A2DP output. applied=$preferredInputCleared")
+            emitLog("Output override cleared to preserve the selected playback route. applied=$outputOverrideCleared")
+        } else if (!config.preferSpeaker && bluetoothInput != null) {
             val preferredInputApplied = session.setPreferredInput(bluetoothInput, error = null)
             val outputOverrideCleared = session.overrideOutputAudioPort(AVAudioSessionPortOverrideNone, error = null)
             emitLog(
@@ -367,17 +389,21 @@ class IosAudioDiagnosticsEngine(
         reconfiguringRoute = true
         runCatching {
             emitLog("Restarting audio graph after route change: $reason")
-            engine.inputNode.removeTapOnBus(0u)
+            if (config.enableInput) {
+                engine.inputNode.removeTapOnBus(0u)
+            }
             player.stop()
             player.reset()
             engine.stop()
             configurePreferredRoute(session)
-            if (!installInputTap(engine.inputNode, session, reason)) {
-                running = false
-                cleanupAudioGraph()
-                unregisterSessionObservers()
-                updateRoute("Audio graph recovery failed")
-                return@runCatching
+            if (config.enableInput) {
+                if (!installInputTap(engine.inputNode, session, reason)) {
+                    running = false
+                    cleanupAudioGraph()
+                    unregisterSessionObservers()
+                    updateRoute("Audio graph recovery failed")
+                    return@runCatching
+                }
             }
             engine.prepare()
             if (!startAudioGraph(reason)) {

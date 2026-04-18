@@ -5,6 +5,8 @@ data class AudioDiagnosticsConfig(
     val ioBufferFrames: Int = 1_024,
     val preferSpeaker: Boolean = true,
     val voiceProcessing: Boolean = true,
+    val enableInput: Boolean = true,
+    val preferBluetoothA2dpOutput: Boolean = false,
 )
 
 data class AudioRouteSnapshot(
