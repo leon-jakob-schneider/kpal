@@ -112,6 +112,20 @@ private struct AudioQAStepDefinition: Identifiable {
     let kind: AudioQAStepKind
 }
 
+private struct AudioEnginePolicy: Equatable {
+    let preferSpeaker: Bool
+    let enableInput: Bool
+    let preferBluetoothA2dpOutput: Bool
+    let voiceProcessing: Bool
+
+    static let builtIn = AudioEnginePolicy(
+        preferSpeaker: true,
+        enableInput: true,
+        preferBluetoothA2dpOutput: false,
+        voiceProcessing: true
+    )
+}
+
 @MainActor
 final class AudioQAViewModel: ObservableObject {
     @Published private(set) var state = AudioDiagnosticState()
@@ -183,7 +197,7 @@ final class AudioQAViewModel: ObservableObject {
     ]
 
     private var device: DeviceImpl
-    private var currentPreferSpeaker = true
+    private var currentPolicy = AudioEnginePolicy.builtIn
     private let logDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
@@ -205,7 +219,7 @@ final class AudioQAViewModel: ObservableObject {
     private var peakInputLevelSinceCaptureReset: Float = 0
 
     init() {
-        device = Self.makeDevice(preferSpeaker: true)
+        device = Self.makeDevice(policy: .builtIn)
         appendLog("kpal ready. Use the suite to compare built-in iPhone audio with AirPods and export a report at the end.")
         startPolling()
     }
@@ -233,9 +247,9 @@ final class AudioQAViewModel: ObservableObject {
             for: test,
             "Preparing audio session. kind=\(test.kind.rawValue) preferSpeaker=\(shouldPreferSpeaker(for: test))"
         )
-        let preferSpeaker = shouldPreferSpeaker(for: test)
-        if preferSpeaker != currentPreferSpeaker {
-            replaceEngine(preferSpeaker: preferSpeaker, reason: "Switching route policy for \(test.title)")
+        let policy = policy(for: test)
+        if policy != currentPolicy {
+            replaceEngine(policy: policy, reason: "Switching audio policy for \(test.title)")
         } else if state.isRunning {
             recordTestEvent(for: test, "Audio session already running. Restarting before test.")
             stopSession()
@@ -436,15 +450,34 @@ final class AudioQAViewModel: ObservableObject {
         !test.id.contains("airpods")
     }
 
-    private func replaceEngine(preferSpeaker: Bool, reason: String) {
+    private func policy(for test: AudioQATestDefinition) -> AudioEnginePolicy {
+        if test.id == "airpods-playback" {
+            return AudioEnginePolicy(
+                preferSpeaker: false,
+                enableInput: false,
+                preferBluetoothA2dpOutput: true,
+                voiceProcessing: false
+            )
+        }
+        return AudioEnginePolicy(
+            preferSpeaker: shouldPreferSpeaker(for: test),
+            enableInput: true,
+            preferBluetoothA2dpOutput: false,
+            voiceProcessing: true
+        )
+    }
+
+    private func replaceEngine(policy: AudioEnginePolicy, reason: String) {
         device.audio.stop()
-        currentPreferSpeaker = preferSpeaker
-        device = Self.makeDevice(preferSpeaker: preferSpeaker)
-        appendLog("\(reason). preferSpeaker=\(preferSpeaker)")
+        currentPolicy = policy
+        device = Self.makeDevice(policy: policy)
+        appendLog(
+            "\(reason). preferSpeaker=\(policy.preferSpeaker) enableInput=\(policy.enableInput) preferBluetoothA2dpOutput=\(policy.preferBluetoothA2dpOutput)"
+        )
         refreshState()
     }
 
-    private static func makeDevice(preferSpeaker: Bool) -> DeviceImpl {
+    private static func makeDevice(policy: AudioEnginePolicy) -> DeviceImpl {
         DeviceImpl(
             platformContext: nil,
             callbacks: nil,
@@ -452,8 +485,10 @@ final class AudioQAViewModel: ObservableObject {
                 audio: AudioDiagnosticsConfig(
                     sampleRate: 24_000,
                     ioBufferFrames: 1_024,
-                    preferSpeaker: preferSpeaker,
-                    voiceProcessing: true
+                    preferSpeaker: policy.preferSpeaker,
+                    voiceProcessing: policy.voiceProcessing,
+                    enableInput: policy.enableInput,
+                    preferBluetoothA2dpOutput: policy.preferBluetoothA2dpOutput
                 )
             )
         )
@@ -560,9 +595,13 @@ final class AudioQAViewModel: ObservableObject {
 
     private func routeMatchesExpectation(for test: AudioQATestDefinition) -> Bool {
         if shouldPreferSpeaker(for: test) {
-            return state.builtInAudioActive && !state.bluetoothActive
+            return state.inputRoute.contains("MicrophoneBuiltIn") &&
+                (state.outputRoute.contains("Speaker") || state.outputRoute.contains("BuiltInReceiver"))
         }
-        return state.bluetoothActive && (state.inputRoute.contains("Bluetooth") || state.outputRoute.contains("Bluetooth"))
+        if test.kind == .capturedLoopback {
+            return state.inputRoute.contains("BluetoothHFP") && state.outputRoute.contains("BluetoothHFP")
+        }
+        return state.outputRoute.contains("BluetoothA2DPOutput")
     }
 
     private var capturedSpeechLooksValid: Bool {
@@ -783,7 +822,12 @@ struct AudioQATestView: View {
             stepMessage = nil
             await enterCurrentStep()
         }
-        .onChange(of: currentStepIndex) { _, _ in
+        .onChange(of: currentStepIndex) { _, newValue in
+            let clamped = clampedStepIndex(for: newValue)
+            if clamped != newValue {
+                currentStepIndex = clamped
+                return
+            }
             Task {
                 await enterCurrentStep()
             }
@@ -807,7 +851,7 @@ struct AudioQATestView: View {
                     }
                     .buttonStyle(.bordered)
                     Spacer()
-                    Text("Step \(currentStepIndex + 1) of \(steps.count)")
+                    Text("Step \(displayStepIndex) of \(steps.count)")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
@@ -947,8 +991,23 @@ struct AudioQATestView: View {
         test.id.contains("airpods")
     }
 
+    private var displayStepIndex: Int {
+        min(clampedStepIndex + 1, steps.count)
+    }
+
+    private var clampedStepIndex: Int {
+        clampedStepIndex(for: currentStepIndex)
+    }
+
+    private func clampedStepIndex(for index: Int) -> Int {
+        guard !steps.isEmpty else {
+            return 0
+        }
+        return min(max(index, 0), steps.count - 1)
+    }
+
     private var currentStep: AudioQAStepDefinition {
-        steps[currentStepIndex]
+        steps[clampedStepIndex]
     }
 
     private func enterCurrentStep() async {
@@ -959,6 +1018,7 @@ struct AudioQATestView: View {
     }
 
     private func runCurrentStepAction() {
+        let currentStep = currentStep
         Task {
             isWorking = true
             stepMessage = nil
@@ -971,13 +1031,13 @@ struct AudioQATestView: View {
                 if let message = await viewModel.verifyEnvironment(for: test) {
                     stepMessage = message
                 } else {
-                    currentStepIndex += 1
+                    advanceToNextStep()
                 }
             case .captureSpeech:
                 if let message = await viewModel.verifySpeechCapture(for: test) {
                     stepMessage = message
                 } else {
-                    currentStepIndex += 1
+                    advanceToNextStep()
                 }
             case .playTone:
                 if let message = await viewModel.verifyActiveRoute(for: test) {
@@ -985,18 +1045,25 @@ struct AudioQATestView: View {
                     return
                 }
                 viewModel.playTestTone(for: test)
-                currentStepIndex += 1
+                advanceToNextStep()
             case .playCapturedAudio:
                 if let message = await viewModel.verifyActiveRoute(for: test) {
                     stepMessage = message
                     return
                 }
                 viewModel.playCapturedAudio(for: test)
-                currentStepIndex += 1
+                advanceToNextStep()
             case .verdict:
                 break
             }
         }
+    }
+
+    private func advanceToNextStep() {
+        guard currentStepIndex + 1 < steps.count else {
+            return
+        }
+        currentStepIndex += 1
     }
 
     private func skipTest() {
