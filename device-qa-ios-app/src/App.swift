@@ -679,7 +679,7 @@ struct AudioQAAppView: View {
     var body: some View {
         ZStack {
             LinearGradient(
-                colors: [Color(red: 0.94, green: 0.92, blue: 0.86), Color(red: 0.84, green: 0.90, blue: 0.88)],
+                colors: QATheme.backgroundGradient,
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
@@ -855,7 +855,7 @@ struct AudioQATestView: View {
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(Capsule().fill(Color.black.opacity(0.06)))
+                        .background(Capsule().fill(QATheme.badgeBackground))
                 }
             }
         }
@@ -1141,12 +1141,33 @@ private func qaCard<Content: View>(@ViewBuilder content: () -> Content) -> some 
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.white.opacity(0.84))
+                .fill(QATheme.cardBackground)
                 .overlay(
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                        .stroke(QATheme.cardBorder, lineWidth: 1)
                 )
         )
+}
+
+private enum QATheme {
+    static var backgroundGradient: [Color] {
+        [
+            Color(uiColor: .systemGroupedBackground),
+            Color(uiColor: .secondarySystemGroupedBackground),
+        ]
+    }
+
+    static var cardBackground: Color {
+        Color(uiColor: .tertiarySystemGroupedBackground)
+    }
+
+    static var cardBorder: Color {
+        Color(uiColor: .separator).opacity(0.7)
+    }
+
+    static var badgeBackground: Color {
+        Color(uiColor: .secondarySystemFill)
+    }
 }
 
 private func diagnosticsCard(_ title: String, text: String) -> some View {
