@@ -1,21 +1,21 @@
 package app.miso.device
 
 import android.content.Context
-import app.miso.audio.AndroidAudioDiagnosticsEngine
-import app.miso.audio.AudioDiagnosticsCallbacks
-import app.miso.audio.AudioDuplexEngine
+import app.miso.audio.AndroidAudioEngine
+import app.miso.audio.AudioEngine
+import app.miso.audio.AudioSessionObserver
 
 actual class DeviceImpl actual constructor(
     platformContext: Any?,
-    callbacks: AudioDiagnosticsCallbacks?,
+    audioObserver: AudioSessionObserver?,
     config: DeviceConfig,
 ) : Device {
     private val context = platformContext as? Context
         ?: error("Android DeviceImpl requires an Android Context as platformContext.")
 
-    actual override val audio: AudioDuplexEngine = AndroidAudioDiagnosticsEngine(
+    actual override val audio: AudioEngine = AndroidAudioEngine(
         context = context,
-        callbacks = callbacks,
+        observer = audioObserver,
         config = config.audio,
     )
 }

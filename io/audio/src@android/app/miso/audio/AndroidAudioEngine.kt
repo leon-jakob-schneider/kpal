@@ -9,17 +9,14 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.SystemClock
-import java.io.ByteArrayOutputStream
 import kotlin.concurrent.thread
-import kotlin.math.PI
-import kotlin.math.sin
 import kotlin.math.sqrt
 
-class AndroidAudioDiagnosticsEngine(
+class AndroidAudioEngine(
     private val context: Context,
-    private val callbacks: AudioDiagnosticsCallbacks? = null,
-    private val config: AudioDiagnosticsConfig = AudioDiagnosticsConfig(),
-) : AudioDuplexEngine {
+    private val observer: AudioSessionObserver? = null,
+    private val config: AudioSessionConfig = AudioSessionConfig(),
+) : AudioEngine {
     @Volatile
     private var running = false
 
@@ -33,7 +30,7 @@ class AndroidAudioDiagnosticsEngine(
     private var playedBytes = 0L
 
     @Volatile
-    private var lastRoute: AudioRouteSnapshot? = null
+    private var lastRoute: AudioRoute? = null
 
     @Volatile
     private var lastMessage = "Idle"
@@ -42,11 +39,9 @@ class AndroidAudioDiagnosticsEngine(
     private var audioTrack: AudioTrack? = null
     private var captureThread: Thread? = null
     private val captureLock = Any()
-    private val capturedAudio = ByteArrayOutputStream()
     private val pendingCapturedChunks = ArrayDeque<ByteArray>()
-    private val pendingLogs = ArrayDeque<String>()
 
-    override fun requestRecordPermission(onResult: (Boolean) -> Unit) {
+    override fun requestInputPermission(onResult: (Boolean) -> Unit) {
         onResult(true)
     }
 
@@ -54,6 +49,11 @@ class AndroidAudioDiagnosticsEngine(
         if (running) {
             emitLog("Start ignored because the engine is already running.")
             return
+        }
+        synchronized(captureLock) {
+            pendingCapturedChunks.clear()
+            capturedBytes = 0
+            playedBytes = 0
         }
 
         runCatching {
@@ -65,12 +65,12 @@ class AndroidAudioDiagnosticsEngine(
             running = true
             record.startRecording()
             track.play()
-            updateRoute("Started full-duplex diagnostic capture")
+            updateRoute("Started full-duplex audio session")
             startCaptureLoop(record)
         }.onFailure { error ->
             running = false
             cleanupAudio()
-            emitError(error.message ?: "Android audio diagnostic start failed.")
+            emitError(error.message ?: "Android audio session start failed.")
         }
     }
 
@@ -87,52 +87,6 @@ class AndroidAudioDiagnosticsEngine(
         updateRoute("Stopped")
     }
 
-    override fun clearCapture() {
-        synchronized(captureLock) {
-            capturedAudio.reset()
-            capturedBytes = 0
-            playedBytes = 0
-        }
-        emitState("Cleared captured PCM buffer")
-    }
-
-    override fun playCapturedAudio() {
-        val track = audioTrack ?: createAudioTrack().also { audioTrack = it; it.play() }
-        val bytes = synchronized(captureLock) { capturedAudio.toByteArray() }
-        if (bytes.isEmpty()) {
-            emitLog("No captured audio to play.")
-            return
-        }
-        thread(name = "audio-diagnostic-play-capture") {
-            emitLog("Playing ${bytes.size} captured PCM bytes.")
-            val written = track.write(bytes, 0, bytes.size)
-            if (written > 0) {
-                playedBytes += written.toLong()
-            }
-            emitState("Played captured PCM buffer")
-        }
-    }
-
-    override fun playTestTone() {
-        val track = audioTrack ?: createAudioTrack().also { audioTrack = it; it.play() }
-        thread(name = "audio-diagnostic-tone") {
-            val durationSeconds = 1.5
-            val sampleCount = (config.sampleRate * durationSeconds).toInt()
-            val bytes = ByteArray(sampleCount * 2)
-            for (sampleIndex in 0 until sampleCount) {
-                val sample = (sin(2.0 * PI * 440.0 * sampleIndex / config.sampleRate) * Short.MAX_VALUE * 0.22).toInt()
-                bytes[sampleIndex * 2] = (sample and 0xff).toByte()
-                bytes[sampleIndex * 2 + 1] = ((sample shr 8) and 0xff).toByte()
-            }
-            emitLog("Playing 440 Hz test tone while route is ${lastRoute?.output.orEmpty()}.")
-            val written = track.write(bytes, 0, bytes.size)
-            if (written > 0) {
-                playedBytes += written.toLong()
-            }
-            emitState("Played 440 Hz test tone")
-        }
-    }
-
     override fun playPcm16(bytes: ByteArray) {
         if (bytes.isEmpty()) {
             return
@@ -145,21 +99,16 @@ class AndroidAudioDiagnosticsEngine(
         emitState("Played PCM16 buffer")
     }
 
-    override fun currentState(): AudioDiagnosticsState = AudioDiagnosticsState(
+    override fun currentState(): AudioSessionState = AudioSessionState(
         isRunning = running,
         inputLevel = inputLevel,
         capturedBytes = capturedBytes,
         playedBytes = playedBytes,
         route = routeSnapshot().also { lastRoute = it },
-        lastMessage = lastMessage,
     )
 
-    override fun takeNextCapturedChunk(): ByteArray? = synchronized(captureLock) {
+    override fun takeNextInputPcm16(): ByteArray? = synchronized(captureLock) {
         pendingCapturedChunks.removeFirstOrNull()
-    }
-
-    override fun takeNextLogMessage(): String? = synchronized(captureLock) {
-        pendingLogs.removeFirstOrNull()
     }
 
     private fun createAudioRecord(): AudioRecord {
@@ -216,7 +165,6 @@ class AndroidAudioDiagnosticsEngine(
                 if (read > 0) {
                     val chunk = buffer.copyOf(read)
                     synchronized(captureLock) {
-                        capturedAudio.write(chunk, 0, read)
                         pendingCapturedChunks.addLast(chunk)
                         capturedBytes += read.toLong()
                     }
@@ -280,22 +228,22 @@ class AndroidAudioDiagnosticsEngine(
         emitLog("Route: input=${lastRoute?.input} output=${lastRoute?.output}")
     }
 
-    private fun routeSnapshot(): AudioRouteSnapshot {
+    private fun routeSnapshot(): AudioRoute {
         val manager = audioManager()
         val inputs = manager.getDevices(AudioManager.GET_DEVICES_INPUTS).joinToString { it.diagnosticName() }
         val outputs = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).joinToString { it.diagnosticName() }
         val active = listOf(inputs, outputs).joinToString(" ")
         val bluetooth = active.contains("Bluetooth", ignoreCase = true)
         val builtIn = active.contains("Built-in", ignoreCase = true) || active.contains("Speaker", ignoreCase = true)
-        return AudioRouteSnapshot(
+        return AudioRoute(
             input = inputs.ifBlank { "none" },
             output = outputs.ifBlank { "none" },
             category = "AudioManager",
             mode = audioModeName(manager.mode),
             sampleRate = config.sampleRate.toDouble(),
             ioBufferDurationMillis = config.ioBufferFrames.toDouble() / config.sampleRate.toDouble() * 1_000.0,
-            bluetoothActive = bluetooth,
-            builtInAudioActive = builtIn,
+            hasBluetooth = bluetooth,
+            hasBuiltInAudio = builtIn,
             timestampMillis = SystemClock.elapsedRealtime(),
         )
     }
@@ -329,23 +277,17 @@ class AndroidAudioDiagnosticsEngine(
         ?: error("AudioManager is unavailable.")
 
     private fun emitLog(message: String) {
-        synchronized(captureLock) {
-            pendingLogs.addLast(message)
-            while (pendingLogs.size > 200) {
-                pendingLogs.removeFirst()
-            }
-        }
-        callbacks?.onLog(message)
+        lastMessage = message
     }
 
     private fun emitError(message: String) {
         lastMessage = message
-        callbacks?.onError(message)
-        callbacks?.onStateChanged(currentState())
+        observer?.onError(AudioError(message))
+        observer?.onStateChanged(currentState())
     }
 
     private fun emitState(message: String) {
         lastMessage = message
-        callbacks?.onStateChanged(currentState())
+        observer?.onStateChanged(currentState())
     }
 }

@@ -8,8 +8,6 @@ struct AudioDiagnosticState {
     var inputLevel: Float = 0
     var capturedBytes: Int64 = 0
     var playedBytes: Int64 = 0
-    var captureCallbacks: Int64 = 0
-    var convertedChunks: Int64 = 0
     var playbackRequests: Int64 = 0
     var inputRoute = "none"
     var outputRoute = "none"
@@ -19,7 +17,6 @@ struct AudioDiagnosticState {
     var ioBufferMillis: Double = 0
     var bluetoothActive = false
     var builtInAudioActive = false
-    var lastMessage = "Idle"
 
     var routeSummary: String {
         """
@@ -217,6 +214,8 @@ final class AudioQAViewModel: ObservableObject {
     private var reportLogLines: [String] = []
     private var currentTestContext: AudioQATestContext?
     private var peakInputLevelSinceCaptureReset: Float = 0
+    private let captureBuffer = AudioCaptureBuffer(maxBytes: 24_000 * 2 * 20)
+    private var playbackRequests: Int64 = 0
 
     init() {
         device = Self.makeDevice(policy: .builtIn)
@@ -278,7 +277,7 @@ final class AudioQAViewModel: ObservableObject {
         }
 
         let granted = await withCheckedContinuation { continuation in
-            device.audio.requestRecordPermission { allowed in
+            device.audio.requestInputPermission { allowed in
                 continuation.resume(returning: allowed.boolValue)
             }
         }
@@ -303,8 +302,8 @@ final class AudioQAViewModel: ObservableObject {
     }
 
     func clearCapture(for test: AudioQATestDefinition? = nil) {
-        device.audio.clearCapture()
-        drainLogs()
+        drainCapture()
+        captureBuffer.clear()
         refreshState()
         peakInputLevelSinceCaptureReset = 0
         if let test {
@@ -316,8 +315,15 @@ final class AudioQAViewModel: ObservableObject {
         if let test {
             recordTestEvent(for: test, "Requested 440 Hz playback.", includeSnapshot: true)
         }
-        device.audio.playTestTone()
-        drainLogs()
+        device.audio.playPcm16(
+            bytes: Pcm16ToneGenerator.shared.sine(
+                frequencyHz: 440,
+                durationMillis: 1_500,
+                sampleRate: 24_000,
+                amplitude: 0.22
+            )
+        )
+        playbackRequests += 1
         refreshState()
         if let test {
             recordTestEvent(for: test, "Playback request finished.", includeSnapshot: true)
@@ -328,8 +334,12 @@ final class AudioQAViewModel: ObservableObject {
         if let test {
             recordTestEvent(for: test, "Requested captured audio playback.", includeSnapshot: true)
         }
-        device.audio.playCapturedAudio()
-        drainLogs()
+        drainCapture()
+        if captureBuffer.play(audio: device.audio) {
+            playbackRequests += 1
+        } else {
+            appendLog("No captured PCM to play.")
+        }
         refreshState()
         if let test {
             recordTestEvent(for: test, "Captured audio playback request finished.", includeSnapshot: true)
@@ -398,6 +408,7 @@ final class AudioQAViewModel: ObservableObject {
         )
         results[test.id] = result
         appendLog("Recorded QA result for \(test.title): \(outcome.rawValue).")
+        stopSession()
         currentTestContext = nil
     }
 
@@ -480,9 +491,9 @@ final class AudioQAViewModel: ObservableObject {
     private static func makeDevice(policy: AudioEnginePolicy) -> DeviceImpl {
         DeviceImpl(
             platformContext: nil,
-            callbacks: nil,
+            audioObserver: nil,
             config: DeviceConfig(
-                audio: AudioDiagnosticsConfig(
+                audio: AudioSessionConfig(
                     sampleRate: 24_000,
                     ioBufferFrames: 1_024,
                     preferSpeaker: policy.preferSpeaker,
@@ -495,33 +506,33 @@ final class AudioQAViewModel: ObservableObject {
     }
 
     private func refreshState() {
+        drainCapture()
         let stateValue = device.audio.currentState()
         let route = stateValue.route
         state = AudioDiagnosticState(
             isRunning: stateValue.isRunning,
             inputLevel: stateValue.inputLevel,
-            capturedBytes: stateValue.capturedBytes,
+            capturedBytes: Int64(captureBuffer.sizeBytes),
             playedBytes: stateValue.playedBytes,
-            captureCallbacks: stateValue.captureCallbacks,
-            convertedChunks: stateValue.convertedChunks,
-            playbackRequests: stateValue.playbackRequests,
+            playbackRequests: playbackRequests,
             inputRoute: route?.input ?? "none",
             outputRoute: route?.output ?? "none",
             category: route?.category ?? "unknown",
             mode: route?.mode ?? "unknown",
             sampleRate: route?.sampleRate ?? 0,
             ioBufferMillis: route?.ioBufferDurationMillis ?? 0,
-            bluetoothActive: route?.bluetoothActive ?? false,
-            builtInAudioActive: route?.builtInAudioActive ?? false,
-            lastMessage: stateValue.lastMessage
+            bluetoothActive: route?.hasBluetooth ?? false,
+            builtInAudioActive: route?.hasBuiltInAudio ?? false
         )
         peakInputLevelSinceCaptureReset = max(peakInputLevelSinceCaptureReset, state.inputLevel)
     }
 
     private func drainLogs() {
-        while let line = device.audio.takeNextLogMessage() {
-            appendLog(line)
-        }
+        drainCapture()
+    }
+
+    private func drainCapture() {
+        captureBuffer.drainFrom(audio: device.audio)
     }
 
     private func appendLog(_ message: String) {
@@ -605,17 +616,14 @@ final class AudioQAViewModel: ObservableObject {
     }
 
     private var capturedSpeechLooksValid: Bool {
-        state.capturedBytes >= 48_000 && peakInputLevelSinceCaptureReset >= 0.015
+        Int64(captureBuffer.sizeBytes) >= 48_000 && peakInputLevelSinceCaptureReset >= 0.015
     }
 
     private func diagnosticSnapshotText() -> String {
         """
         running: \(state.isRunning)
-        last: \(state.lastMessage)
         capturedBytes: \(state.capturedBytes)
         playedBytes: \(state.playedBytes)
-        captureCallbacks: \(state.captureCallbacks)
-        convertedChunks: \(state.convertedChunks)
         playbackRequests: \(state.playbackRequests)
         inputLevel: \(String(format: "%.3f", state.inputLevel))
         route:
