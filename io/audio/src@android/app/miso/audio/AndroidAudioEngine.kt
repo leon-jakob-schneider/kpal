@@ -10,13 +10,15 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.SystemClock
 import kotlin.concurrent.thread
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 import kotlin.math.sqrt
 
 class AndroidAudioEngine(
     private val context: Context,
     private val observer: AudioSessionObserver? = null,
     private val config: AudioSessionConfig = AudioSessionConfig(),
-) : AudioEngine {
+) : Audio, AudioEngine, AudioDuplex {
     @Volatile
     private var running = false
 
@@ -41,11 +43,20 @@ class AndroidAudioEngine(
     private val captureLock = Any()
     private val pendingCapturedChunks = ArrayDeque<ByteArray>()
 
-    override fun requestInputPermission(onResult: (Boolean) -> Unit) {
-        onResult(true)
+    override suspend fun requestEngine(): AudioEngineRequest = suspendCoroutine { continuation ->
+        continuation.resume(AudioEngineRequest(engine = this))
     }
 
-    override fun start() {
+    override suspend fun useDuplex(block: (AudioDuplex) -> Unit) {
+        start()
+        try {
+            block(this)
+        } finally {
+            stop()
+        }
+    }
+
+    private fun start() {
         if (running) {
             emitLog("Start ignored because the engine is already running.")
             return
@@ -74,7 +85,7 @@ class AndroidAudioEngine(
         }
     }
 
-    override fun stop() {
+    private fun stop() {
         if (!running && audioRecord == null && audioTrack == null) {
             return
         }

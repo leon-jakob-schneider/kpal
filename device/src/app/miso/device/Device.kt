@@ -1,6 +1,6 @@
 package app.miso.device
 
-import app.miso.audio.AudioEngine
+import app.miso.audio.Audio
 import app.miso.audio.AudioSessionConfig
 import app.miso.audio.AudioSessionObserver
 
@@ -9,7 +9,7 @@ data class DeviceConfig(
 )
 
 interface Device {
-    val audio: AudioEngine
+    val audio: Audio
 }
 
 expect class DeviceImpl(
@@ -17,5 +17,5 @@ expect class DeviceImpl(
     audioObserver: AudioSessionObserver? = null,
     config: DeviceConfig = DeviceConfig(),
 ) : Device {
-    override val audio: AudioEngine
+    override val audio: Audio
 }
