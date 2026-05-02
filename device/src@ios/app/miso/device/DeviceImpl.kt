@@ -1,16 +1,16 @@
 package app.miso.device
 
-import app.miso.audio.AudioDiagnosticsCallbacks
-import app.miso.audio.AudioDuplexEngine
-import app.miso.audio.IosAudioDiagnosticsEngine
+import app.miso.audio.AudioEngine
+import app.miso.audio.AudioSessionObserver
+import app.miso.audio.IosAudioEngine
 
 actual class DeviceImpl actual constructor(
     platformContext: Any?,
-    callbacks: AudioDiagnosticsCallbacks?,
+    audioObserver: AudioSessionObserver?,
     config: DeviceConfig,
 ) : Device {
-    actual override val audio: AudioDuplexEngine = IosAudioDiagnosticsEngine(
-        callbacks = callbacks,
+    actual override val audio: AudioEngine = IosAudioEngine(
+        observer = audioObserver,
         config = config.audio,
     )
 }

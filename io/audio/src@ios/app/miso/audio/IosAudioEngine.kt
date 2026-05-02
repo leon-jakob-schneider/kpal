@@ -36,16 +36,14 @@ import platform.Foundation.NSNotification
 import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSProcessInfo
-import kotlin.math.PI
 import kotlin.math.ceil
-import kotlin.math.sin
 import kotlin.math.sqrt
 
 @OptIn(ExperimentalForeignApi::class)
-class IosAudioDiagnosticsEngine(
-    private val callbacks: AudioDiagnosticsCallbacks? = null,
-    private val config: AudioDiagnosticsConfig = AudioDiagnosticsConfig(),
-) : AudioDuplexEngine {
+class IosAudioEngine(
+    private val observer: AudioSessionObserver? = null,
+    private val config: AudioSessionConfig = AudioSessionConfig(),
+) : AudioEngine {
     private val playbackFormat = AVAudioFormat(
         commonFormat = platform.AVFAudio.AVAudioPCMFormatFloat32,
         sampleRate = config.sampleRate.toDouble(),
@@ -70,15 +68,13 @@ class IosAudioDiagnosticsEngine(
     private var captureCallbacks = 0L
     private var convertedChunks = 0L
     private var playbackRequests = 0L
-    private var lastRoute: AudioRouteSnapshot? = null
+    private var lastRoute: AudioRoute? = null
     private var lastMessage = "Idle"
-    private var capturedAudio = ByteArray(0)
     private val pendingCapturedChunks = ArrayDeque<ByteArray>()
-    private val pendingLogs = ArrayDeque<String>()
     private val notificationTokens = mutableListOf<Any>()
     private var reconfiguringRoute = false
 
-    override fun requestRecordPermission(onResult: (Boolean) -> Unit) {
+    override fun requestInputPermission(onResult: (Boolean) -> Unit) {
         val session = AVAudioSession.sharedInstance()
         session.requestRecordPermission { granted ->
             onResult(granted)
@@ -90,6 +86,14 @@ class IosAudioDiagnosticsEngine(
             emitLog("Start ignored because the iOS engine is already running.")
             return
         }
+        withLock {
+            pendingCapturedChunks.clear()
+            capturedBytes = 0
+            playedBytes = 0
+            captureCallbacks = 0
+            convertedChunks = 0
+            playbackRequests = 0
+        }
 
         runCatching {
             val session = AVAudioSession.sharedInstance()
@@ -99,9 +103,9 @@ class IosAudioDiagnosticsEngine(
             val engine = AVAudioEngine()
             val player = AVAudioPlayerNode()
 
-            if (config.enableInput) {
+            if (this.config.enableInput) {
                 val inputNode = engine.inputNode
-                if (config.voiceProcessing && !inputNode.isVoiceProcessingEnabled()) {
+                if (this.config.voiceProcessing && !inputNode.isVoiceProcessingEnabled()) {
                     val enabled = inputNode.setVoiceProcessingEnabled(true, error = null)
                     if (enabled) {
                         emitLog("Enabled AVAudioInputNode voice processing.")
@@ -117,7 +121,7 @@ class IosAudioDiagnosticsEngine(
             engine.prepare()
             audioEngine = engine
             playerNode = player
-            if (config.enableInput) {
+            if (this.config.enableInput) {
                 if (!installInputTap(engine.inputNode, session, reason = "initial start")) {
                     running = false
                     cleanupAudioGraph()
@@ -132,12 +136,12 @@ class IosAudioDiagnosticsEngine(
                 return@runCatching
             }
             running = true
-            updateRoute("Started AVAudioEngine full-duplex diagnostics")
+            updateRoute("Started AVAudioEngine full-duplex audio session")
         }.onFailure { error ->
             running = false
             cleanupAudioGraph()
             unregisterSessionObservers()
-            emitError(error.message ?: "iOS audio diagnostic start failed.")
+            emitError(error.message ?: "iOS audio session start failed.")
         }
     }
 
@@ -151,40 +155,6 @@ class IosAudioDiagnosticsEngine(
         inputLevel = 0f
         updateRoute("Stopped")
         emitLog("Stopped and deactivated AVAudioSession.")
-    }
-
-    override fun clearCapture() {
-        withLock {
-            capturedAudio = ByteArray(0)
-            pendingCapturedChunks.clear()
-            capturedBytes = 0
-            playedBytes = 0
-            captureCallbacks = 0
-            convertedChunks = 0
-            playbackRequests = 0
-        }
-        emitState("Cleared captured PCM buffer")
-    }
-
-    override fun playCapturedAudio() {
-        val bytes = withLock { capturedAudio }
-        if (bytes.isEmpty()) {
-            emitLog("No captured PCM to play.")
-            return
-        }
-        playPcm16(bytes)
-    }
-
-    override fun playTestTone() {
-        val sampleCount = (config.sampleRate * 1.5).toInt()
-        val bytes = ByteArray(sampleCount * 2)
-        for (sampleIndex in 0 until sampleCount) {
-            val sample = (sin(2.0 * PI * 440.0 * sampleIndex / config.sampleRate) * Short.MAX_VALUE * 0.22).toInt()
-            bytes[sampleIndex * 2] = (sample and 0xff).toByte()
-            bytes[sampleIndex * 2 + 1] = ((sample shr 8) and 0xff).toByte()
-        }
-        playPcm16(bytes)
-        emitLog("Played 440 Hz test tone.")
     }
 
     override fun playPcm16(bytes: ByteArray) {
@@ -219,24 +189,16 @@ class IosAudioDiagnosticsEngine(
         emitState("Played PCM16 buffer")
     }
 
-    override fun currentState(): AudioDiagnosticsState = AudioDiagnosticsState(
+    override fun currentState(): AudioSessionState = AudioSessionState(
         isRunning = running,
         inputLevel = inputLevel,
         capturedBytes = capturedBytes,
         playedBytes = playedBytes,
-        captureCallbacks = captureCallbacks,
-        convertedChunks = convertedChunks,
-        playbackRequests = playbackRequests,
         route = routeSnapshot().also { lastRoute = it },
-        lastMessage = lastMessage,
     )
 
-    override fun takeNextCapturedChunk(): ByteArray? = withLock {
+    override fun takeNextInputPcm16(): ByteArray? = withLock {
         pendingCapturedChunks.removeFirstOrNull()
-    }
-
-    override fun takeNextLogMessage(): String? = withLock {
-        pendingLogs.removeFirstOrNull()
     }
 
     private fun configureAudioSession(session: AVAudioSession) {
@@ -444,8 +406,7 @@ class IosAudioDiagnosticsEngine(
         convertedChunks += 1
         withLock {
             pendingCapturedChunks.addLast(bytes)
-            capturedAudio = appendLimited(capturedAudio, bytes, config.sampleRate * 2 * 20)
-            capturedBytes = capturedAudio.size.toLong()
+            capturedBytes += bytes.size.toLong()
         }
         if (convertedChunks == 1L) {
             emitLog("First converted capture chunk bytes=${bytes.size} inputLevel=$inputLevel.")
@@ -454,15 +415,6 @@ class IosAudioDiagnosticsEngine(
                 "Capture health callbacks=$captureCallbacks converted=$convertedChunks capturedBytes=$capturedBytes inputLevel=$inputLevel."
             )
         }
-    }
-
-    private fun appendLimited(existing: ByteArray, chunk: ByteArray, maxBytes: Int): ByteArray {
-        val combined = ByteArray((existing.size + chunk.size).coerceAtMost(maxBytes))
-        val retainedPrefix = (maxBytes - chunk.size).coerceAtLeast(0)
-        val prefix = if (retainedPrefix == 0) ByteArray(0) else existing.takeLast(retainedPrefix).toByteArray()
-        prefix.copyInto(combined, 0, 0, prefix.size)
-        chunk.copyInto(combined, prefix.size, 0, chunk.size.coerceAtMost(combined.size - prefix.size))
-        return combined
     }
 
     private fun calculateLevel(buffer: AVAudioPCMBuffer): Float {
@@ -589,7 +541,7 @@ class IosAudioDiagnosticsEngine(
         updateRoute("Session interrupted")
     }
 
-    private fun routeSnapshot(): AudioRouteSnapshot {
+    private fun routeSnapshot(): AudioRoute {
         val session = AVAudioSession.sharedInstance()
         val inputs = session.currentRoute.inputs.joinToString { value ->
             val port = value as? AVAudioSessionPortDescription
@@ -600,16 +552,16 @@ class IosAudioDiagnosticsEngine(
             "${port?.portType ?: "unknown"}=${port?.portName ?: "unknown"}"
         }
         val routeText = "$inputs $outputs"
-        return AudioRouteSnapshot(
+        return AudioRoute(
             input = inputs.ifEmpty { "none" },
             output = outputs.ifEmpty { "none" },
             category = session.category ?: "unknown",
             mode = session.mode ?: "unknown",
             sampleRate = session.sampleRate,
             ioBufferDurationMillis = session.IOBufferDuration * 1_000.0,
-            bluetoothActive = routeText.contains(AVAudioSessionPortBluetoothHFP.orEmpty()) ||
+            hasBluetooth = routeText.contains(AVAudioSessionPortBluetoothHFP.orEmpty()) ||
                 routeText.contains(AVAudioSessionPortBluetoothA2DP.orEmpty()),
-            builtInAudioActive = routeText.contains(AVAudioSessionPortBuiltInMic.orEmpty()) ||
+            hasBuiltInAudio = routeText.contains(AVAudioSessionPortBuiltInMic.orEmpty()) ||
                 routeText.contains(AVAudioSessionPortBuiltInReceiver.orEmpty()) ||
                 routeText.contains(AVAudioSessionPortBuiltInSpeaker.orEmpty()),
             timestampMillis = (NSProcessInfo.processInfo.systemUptime * 1_000.0).toLong(),
@@ -617,25 +569,19 @@ class IosAudioDiagnosticsEngine(
     }
 
     private fun emitLog(message: String) {
-        withLock {
-            pendingLogs.addLast(message)
-            while (pendingLogs.size > 200) {
-                pendingLogs.removeFirst()
-            }
-        }
-        callbacks?.onLog(message)
+        lastMessage = message
     }
 
     private fun emitError(message: String) {
         lastMessage = message
         emitLog("ERROR: $message")
-        callbacks?.onError(message)
-        callbacks?.onStateChanged(currentState())
+        observer?.onError(AudioError(message))
+        observer?.onStateChanged(currentState())
     }
 
     private fun emitState(message: String) {
         lastMessage = message
-        callbacks?.onStateChanged(currentState())
+        observer?.onStateChanged(currentState())
     }
 
     private fun updateRoute(message: String) {

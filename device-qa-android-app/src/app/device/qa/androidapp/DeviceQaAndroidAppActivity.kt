@@ -16,16 +16,19 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
-import app.miso.audio.AudioDiagnosticsCallbacks
-import app.miso.audio.AudioDiagnosticsConfig
-import app.miso.audio.AudioDiagnosticsState
+import app.miso.audio.AudioCaptureBuffer
+import app.miso.audio.AudioError
+import app.miso.audio.AudioSessionConfig
+import app.miso.audio.AudioSessionObserver
+import app.miso.audio.AudioSessionState
+import app.miso.audio.Pcm16ToneGenerator
 import app.miso.device.DeviceConfig
 import app.miso.device.DeviceImpl
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
+class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
     private lateinit var device: DeviceImpl
     private lateinit var statusView: TextView
     private lateinit var routeView: TextView
@@ -35,14 +38,15 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val logs = ArrayDeque<String>()
+    private val captureBuffer = AudioCaptureBuffer(maxBytes = 24_000 * 2 * 20)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         device = DeviceImpl(
             platformContext = applicationContext,
-            callbacks = this,
+            audioObserver = this,
             config = DeviceConfig(
-                audio = AudioDiagnosticsConfig(
+                audio = AudioSessionConfig(
                     sampleRate = 24_000,
                     ioBufferFrames = 1_024,
                     preferSpeaker = true,
@@ -71,16 +75,12 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
         }
     }
 
-    override fun onStateChanged(state: AudioDiagnosticsState) {
+    override fun onStateChanged(state: AudioSessionState) {
         runOnUiThread { renderState(state) }
     }
 
-    override fun onLog(message: String) {
-        runOnUiThread { appendLog(message) }
-    }
-
-    override fun onError(message: String) {
-        runOnUiThread { appendLog("ERROR: $message") }
+    override fun onError(error: AudioError) {
+        runOnUiThread { appendLog("ERROR: ${error.message}") }
     }
 
     private fun createContent(): View {
@@ -114,9 +114,22 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
             }
         })
         content.addView(button("Stop") { device.audio.stop() })
-        content.addView(button("Play 440 Hz Tone") { device.audio.playTestTone() })
-        content.addView(button("Play Captured Audio") { device.audio.playCapturedAudio() })
-        content.addView(button("Clear Capture") { device.audio.clearCapture() })
+        content.addView(button("Play 440 Hz Tone") {
+            device.audio.playPcm16(Pcm16ToneGenerator.sine())
+            appendLog("Requested 440 Hz tone playback.")
+        })
+        content.addView(button("Play Captured Audio") {
+            drainCapture()
+            if (captureBuffer.play(device.audio)) {
+                appendLog("Requested captured PCM playback.")
+            } else {
+                appendLog("No captured PCM to play.")
+            }
+        })
+        content.addView(button("Clear Capture") {
+            captureBuffer.clear()
+            appendLog("Cleared QA capture buffer.")
+        })
 
         content.addView(title("Log"))
         logView = TextView(this).apply {
@@ -135,10 +148,11 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
         }
     }
 
-    private fun renderState(state: AudioDiagnosticsState) {
+    private fun renderState(state: AudioSessionState) {
+        drainCapture()
         statusView.text = """
             running: ${state.isRunning}
-            last: ${state.lastMessage}
+            qaCapturedBytes: ${captureBuffer.sizeBytes}
         """.trimIndent()
         val route = state.route
         routeView.text = if (route == null) {
@@ -150,8 +164,8 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
             mode: ${route.mode}
             sampleRate: ${route.sampleRate.toInt()} Hz
             ioBuffer: ${"%.2f".format(route.ioBufferDurationMillis)} ms
-            bluetooth: ${route.bluetoothActive}
-            builtInAudio: ${route.builtInAudioActive}
+            bluetooth: ${route.hasBluetooth}
+            builtInAudio: ${route.hasBuiltInAudio}
             """.trimIndent()
         }
         counterView.text = """
@@ -168,6 +182,10 @@ class DeviceQaAndroidAppActivity : Activity(), AudioDiagnosticsCallbacks {
             logs.removeLast()
         }
         logView.text = logs.joinToString(separator = "\n")
+    }
+
+    private fun drainCapture() {
+        captureBuffer.drainFrom(device.audio)
     }
 
     private fun title(text: String): TextView = TextView(this).apply {
