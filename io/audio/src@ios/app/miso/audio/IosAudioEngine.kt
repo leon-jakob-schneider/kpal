@@ -61,7 +61,8 @@ class IosAudioEngine(
     private var audioEngine: AVAudioEngine? = null
     private var playerNode: AVAudioPlayerNode? = null
     private var captureFormat: AVAudioFormat? = null
-    private var running = false
+    private var audioGraphStarted = false
+    private var captureReady = false
     private var inputLevel = 0f
     private var capturedBytes = 0L
     private var playedBytes = 0L
@@ -82,7 +83,7 @@ class IosAudioEngine(
     }
 
     override fun start() {
-        if (running) {
+        if (audioGraphStarted) {
             emitLog("Start ignored because the iOS engine is already running.")
             return
         }
@@ -93,6 +94,7 @@ class IosAudioEngine(
             captureCallbacks = 0
             convertedChunks = 0
             playbackRequests = 0
+            captureReady = false
         }
 
         runCatching {
@@ -123,22 +125,26 @@ class IosAudioEngine(
             playerNode = player
             if (this.config.enableInput) {
                 if (!installInputTap(engine.inputNode, session, reason = "initial start")) {
-                    running = false
+                    audioGraphStarted = false
+                    captureReady = false
                     cleanupAudioGraph()
                     unregisterSessionObservers()
                     return@runCatching
                 }
             }
             if (!startAudioGraph(reason = "initial start")) {
-                running = false
+                audioGraphStarted = false
+                captureReady = false
                 cleanupAudioGraph()
                 unregisterSessionObservers()
                 return@runCatching
             }
-            running = true
+            audioGraphStarted = true
+            captureReady = !this.config.enableInput
             updateRoute("Started AVAudioEngine full-duplex audio session")
         }.onFailure { error ->
-            running = false
+            audioGraphStarted = false
+            captureReady = false
             cleanupAudioGraph()
             unregisterSessionObservers()
             emitError(error.message ?: "iOS audio session start failed.")
@@ -146,7 +152,8 @@ class IosAudioEngine(
     }
 
     override fun stop() {
-        running = false
+        audioGraphStarted = false
+        captureReady = false
         cleanupAudioGraph()
         unregisterSessionObservers()
         val session = AVAudioSession.sharedInstance()
@@ -190,7 +197,7 @@ class IosAudioEngine(
     }
 
     override fun currentState(): AudioSessionState = AudioSessionState(
-        isRunning = running,
+        isRunning = isReady(),
         inputLevel = inputLevel,
         capturedBytes = capturedBytes,
         playedBytes = playedBytes,
@@ -354,13 +361,16 @@ class IosAudioEngine(
             if (config.enableInput) {
                 engine.inputNode.removeTapOnBus(0u)
             }
+            audioGraphStarted = false
+            captureReady = false
             player.stop()
             player.reset()
             engine.stop()
             configurePreferredRoute(session)
             if (config.enableInput) {
                 if (!installInputTap(engine.inputNode, session, reason)) {
-                    running = false
+                    audioGraphStarted = false
+                    captureReady = false
                     cleanupAudioGraph()
                     unregisterSessionObservers()
                     updateRoute("Audio graph recovery failed")
@@ -369,15 +379,19 @@ class IosAudioEngine(
             }
             engine.prepare()
             if (!startAudioGraph(reason)) {
-                running = false
+                audioGraphStarted = false
+                captureReady = false
                 cleanupAudioGraph()
                 unregisterSessionObservers()
                 updateRoute("Audio graph recovery failed")
                 return@runCatching
             }
+            audioGraphStarted = true
+            captureReady = !config.enableInput
             updateRoute("Restarted audio graph")
         }.onFailure { error ->
-            running = false
+            audioGraphStarted = false
+            captureReady = false
             cleanupAudioGraph()
             unregisterSessionObservers()
             emitError(error.message ?: "Route change recovery failed.")
@@ -408,12 +422,19 @@ class IosAudioEngine(
             pendingCapturedChunks.addLast(bytes)
             capturedBytes += bytes.size.toLong()
         }
+        val becameReady = !captureReady
+        captureReady = true
         if (convertedChunks == 1L) {
             emitLog("First converted capture chunk bytes=${bytes.size} inputLevel=$inputLevel.")
+            emitState("First converted capture chunk")
+        } else if (becameReady) {
+            emitLog("Capture ready after graph restart chunk bytes=${bytes.size} inputLevel=$inputLevel.")
+            emitState("Capture ready")
         } else if (convertedChunks % 50L == 0L) {
             emitLog(
                 "Capture health callbacks=$captureCallbacks converted=$convertedChunks capturedBytes=$capturedBytes inputLevel=$inputLevel."
             )
+            emitState("Capture health")
         }
     }
 
@@ -528,7 +549,7 @@ class IosAudioEngine(
         emitLog(
             "AVAudioSession route change notification reason=${routeChangeReasonDescription(userInfoText)} userInfo=$userInfoText"
         )
-        if (running) {
+        if (audioGraphStarted) {
             restartAudioGraphAfterRouteChange(userInfoText)
         } else {
             updateRoute("Route changed")
@@ -567,6 +588,8 @@ class IosAudioEngine(
             timestampMillis = (NSProcessInfo.processInfo.systemUptime * 1_000.0).toLong(),
         )
     }
+
+    private fun isReady(): Boolean = audioGraphStarted && (!config.enableInput || captureReady)
 
     private fun emitLog(message: String) {
         lastMessage = message

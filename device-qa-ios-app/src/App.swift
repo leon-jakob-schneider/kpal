@@ -40,6 +40,7 @@ struct AudioDiagnosticState {
 enum AudioQATestKind: String {
     case tonePlayback = "Tone Playback"
     case capturedLoopback = "Captured Loopback"
+    case recordingCoverage = "Recording Coverage"
 }
 
 enum AudioQATestOutcome: String {
@@ -96,6 +97,7 @@ private enum AudioQAStepKind {
     case confirmBuiltInRoute
     case confirmAirPodsRoute
     case captureSpeech
+    case runRecordingCoverage
     case playTone
     case playCapturedAudio
     case verdict
@@ -124,7 +126,7 @@ private struct AudioEnginePolicy: Equatable {
 }
 
 @MainActor
-final class AudioQAViewModel: ObservableObject {
+final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     @Published private(set) var state = AudioDiagnosticState()
     @Published private(set) var logLines: [String] = []
     @Published private(set) var activeTests: [AudioQATestDefinition] = []
@@ -132,6 +134,21 @@ final class AudioQAViewModel: ObservableObject {
     @Published private(set) var isPreparingSession = false
 
     let tests: [AudioQATestDefinition] = [
+        AudioQATestDefinition(
+            id: "iphone-recording-coverage",
+            title: "iPhone Recording Coverage",
+            summary: "Verify that capture starts promptly and records nearly the full timed window after the session reports running.",
+            kind: .recordingCoverage,
+            instructions: [
+                "Disconnect AirPods or any other external audio device.",
+                "Keep the phone awake and do not switch apps while the check runs.",
+                "Tap the check button. The app will restart the session and measure captured PCM against wall-clock time.",
+                "The test fails if early capture is missing or the final recording duration is too short."
+            ],
+            actionTitle: "Run Recording Check",
+            passTitle: "Recording coverage passed",
+            failTitle: "Recording coverage failed"
+        ),
         AudioQATestDefinition(
             id: "iphone-speaker-playback",
             title: "iPhone Speaker Playback",
@@ -193,7 +210,7 @@ final class AudioQAViewModel: ObservableObject {
         ),
     ]
 
-    private var device: DeviceImpl
+    private var device: DeviceImpl!
     private var currentPolicy = AudioEnginePolicy.builtIn
     private let logDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -216,9 +233,13 @@ final class AudioQAViewModel: ObservableObject {
     private var peakInputLevelSinceCaptureReset: Float = 0
     private let captureBuffer = AudioCaptureBuffer(maxBytes: 24_000 * 2 * 20)
     private var playbackRequests: Int64 = 0
+    private var observerEventCount = 0
+    private var lastObserverCapturedBytes: Int64 = 0
+    private var firstObserverCaptureLogged = false
 
-    init() {
-        device = Self.makeDevice(policy: .builtIn)
+    override init() {
+        super.init()
+        device = Self.makeDevice(policy: .builtIn, observer: self)
         appendLog("kpal ready. Use the suite to compare built-in iPhone audio with AirPods and export a report at the end.")
         startPolling()
     }
@@ -226,6 +247,18 @@ final class AudioQAViewModel: ObservableObject {
     deinit {
         pollTask?.cancel()
         device.audio.stop()
+    }
+
+    nonisolated func onStateChanged(state: AudioSessionState) {
+        Task { @MainActor [weak self] in
+            self?.recordObservedAudioState(state)
+        }
+    }
+
+    nonisolated func onError(error: AudioError) {
+        Task { @MainActor [weak self] in
+            self?.appendLog("AUDIO ERROR: \(error.message)")
+        }
     }
 
     func beginSuite() {
@@ -288,9 +321,9 @@ final class AudioQAViewModel: ObservableObject {
         }
 
         appendLog("Microphone permission granted.")
+        resetObserverCaptureTracking()
         device.audio.start()
-        drainLogs()
-        refreshState()
+        await waitForAudioSessionRunning()
         return state.isRunning
     }
 
@@ -299,6 +332,7 @@ final class AudioQAViewModel: ObservableObject {
         drainLogs()
         refreshState()
         peakInputLevelSinceCaptureReset = 0
+        resetObserverCaptureTracking()
     }
 
     func clearCapture(for test: AudioQATestDefinition? = nil) {
@@ -306,6 +340,7 @@ final class AudioQAViewModel: ObservableObject {
         captureBuffer.clear()
         refreshState()
         peakInputLevelSinceCaptureReset = 0
+        resetObserverCaptureTracking()
         if let test {
             recordTestEvent(for: test, "Cleared capture buffer.", includeSnapshot: true)
         }
@@ -389,6 +424,73 @@ final class AudioQAViewModel: ObservableObject {
             }
             return "AirPods are no longer the active audio route. Reconnect them and try again."
         }
+        return nil
+    }
+
+    func runRecordingCoverageCheck(for test: AudioQATestDefinition) async -> String? {
+        recordTestEvent(for: test, "Restarting audio session for recording coverage timing.", includeSnapshot: true)
+        stopSession()
+
+        let ready = await ensureSessionReady()
+        guard ready else {
+            let message = "Audio setup failed. Check microphone permission and try again."
+            recordTestEvent(for: test, message, includeSnapshot: true)
+            return message
+        }
+
+        let routeMatched = await waitForExpectedRoute(for: test)
+        guard routeMatched else {
+            let message = "The phone is not using its built-in mic and speaker after restart. Disconnect external audio devices and try again."
+            recordTestEvent(for: test, message, includeSnapshot: true)
+            return message
+        }
+
+        clearCapture(for: test)
+        let startedAt = Date()
+        recordTestEvent(for: test, "Started timed capture coverage window.", includeSnapshot: true)
+
+        let checkpoints: [(label: String, seconds: TimeInterval, minimumCapturedMillis: Double)] = [
+            ("early", 0.75, 600),
+            ("middle", 1.50, 1_300),
+            ("final", 3.00, 2_800),
+        ]
+        var finalCapturedMillis = 0.0
+        var failedCheckpoint: String?
+
+        for checkpoint in checkpoints {
+            let targetDate = startedAt.addingTimeInterval(checkpoint.seconds)
+            let remaining = targetDate.timeIntervalSinceNow
+            if remaining > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+            }
+            refreshState()
+            let capturedMillis = capturedMillis(fromBytes: state.capturedBytes)
+            finalCapturedMillis = capturedMillis
+            recordTestEvent(
+                for: test,
+                "\(checkpoint.label) checkpoint elapsed=\(formatMillis(Date().timeIntervalSince(startedAt) * 1_000))ms captured=\(formatMillis(capturedMillis))ms bytes=\(state.capturedBytes) minimum=\(formatMillis(checkpoint.minimumCapturedMillis))ms",
+                includeSnapshot: true
+            )
+            if capturedMillis < checkpoint.minimumCapturedMillis && failedCheckpoint == nil {
+                failedCheckpoint = "\(checkpoint.label) checkpoint captured \(formatMillis(capturedMillis)) ms; expected at least \(formatMillis(checkpoint.minimumCapturedMillis)) ms."
+            }
+        }
+
+        let elapsedMillis = Date().timeIntervalSince(startedAt) * 1_000
+        let expectedMillis = capturedMillis(fromBytes: expectedCapturedBytes(forElapsedMillis: elapsedMillis))
+        let coverageRatio = expectedMillis > 0 ? finalCapturedMillis / expectedMillis : 0
+        recordTestEvent(
+            for: test,
+            "Completed recording coverage check elapsed=\(formatMillis(elapsedMillis))ms captured=\(formatMillis(finalCapturedMillis))ms coverage=\(String(format: "%.3f", coverageRatio)).",
+            includeSnapshot: true
+        )
+
+        if let failedCheckpoint {
+            let message = "Recording started late or dropped initial audio: \(failedCheckpoint)"
+            recordTestEvent(for: test, message, includeSnapshot: true)
+            return message
+        }
+
         return nil
     }
 
@@ -480,18 +582,19 @@ final class AudioQAViewModel: ObservableObject {
 
     private func replaceEngine(policy: AudioEnginePolicy, reason: String) {
         device.audio.stop()
+        resetObserverCaptureTracking()
         currentPolicy = policy
-        device = Self.makeDevice(policy: policy)
+        device = Self.makeDevice(policy: policy, observer: self)
         appendLog(
             "\(reason). preferSpeaker=\(policy.preferSpeaker) enableInput=\(policy.enableInput) preferBluetoothA2dpOutput=\(policy.preferBluetoothA2dpOutput)"
         )
         refreshState()
     }
 
-    private static func makeDevice(policy: AudioEnginePolicy) -> DeviceImpl {
+    private static func makeDevice(policy: AudioEnginePolicy, observer: AudioSessionObserver?) -> DeviceImpl {
         DeviceImpl(
             platformContext: nil,
-            audioObserver: nil,
+            audioObserver: observer,
             config: DeviceConfig(
                 audio: AudioSessionConfig(
                     sampleRate: 24_000,
@@ -525,6 +628,37 @@ final class AudioQAViewModel: ObservableObject {
             builtInAudioActive: route?.hasBuiltInAudio ?? false
         )
         peakInputLevelSinceCaptureReset = max(peakInputLevelSinceCaptureReset, state.inputLevel)
+    }
+
+    private func recordObservedAudioState(_ observedState: AudioSessionState) {
+        observerEventCount += 1
+        let observedCapturedBytes = observedState.capturedBytes
+        let shouldLogFirstCapture = observedState.isRunning && observedCapturedBytes > 0 && !firstObserverCaptureLogged
+        let shouldLogPeriodicCapture = observedState.isRunning &&
+            observedCapturedBytes > 0 &&
+            observedCapturedBytes != lastObserverCapturedBytes &&
+            observerEventCount % 50 == 0
+        let shouldLogRouteOrLifecycle = observerEventCount <= 6 || observedState.isRunning != state.isRunning
+
+        guard shouldLogFirstCapture || shouldLogPeriodicCapture || shouldLogRouteOrLifecycle else {
+            lastObserverCapturedBytes = observedCapturedBytes
+            return
+        }
+
+        if shouldLogFirstCapture {
+            firstObserverCaptureLogged = true
+        }
+        lastObserverCapturedBytes = observedCapturedBytes
+        let route = observedState.route
+        appendLog(
+            "AUDIO STATE event=\(observerEventCount) running=\(observedState.isRunning) capturedBytes=\(observedCapturedBytes) playedBytes=\(observedState.playedBytes) inputLevel=\(String(format: "%.3f", observedState.inputLevel)) input=\(route?.input ?? "none") output=\(route?.output ?? "none")"
+        )
+    }
+
+    private func resetObserverCaptureTracking() {
+        observerEventCount = 0
+        lastObserverCapturedBytes = 0
+        firstObserverCaptureLogged = false
     }
 
     private func drainLogs() {
@@ -574,6 +708,18 @@ final class AudioQAViewModel: ObservableObject {
         "running=\(state.isRunning) input=\(state.inputRoute) output=\(state.outputRoute) sampleRate=\(Int(state.sampleRate))Hz ioBuffer=\(String(format: "%.2f", state.ioBufferMillis))ms inputLevel=\(String(format: "%.3f", state.inputLevel)) capturedBytes=\(state.capturedBytes) playedBytes=\(state.playedBytes) playbackRequests=\(state.playbackRequests)"
     }
 
+    private func capturedMillis(fromBytes bytes: Int64) -> Double {
+        Double(bytes) / 2.0 / 24_000.0 * 1_000.0
+    }
+
+    private func expectedCapturedBytes(forElapsedMillis elapsedMillis: Double) -> Int64 {
+        Int64((elapsedMillis / 1_000.0 * 24_000.0 * 2.0).rounded())
+    }
+
+    private func formatMillis(_ value: Double) -> String {
+        String(format: "%.0f", value)
+    }
+
     private func finalizedTimeline(for test: AudioQATestDefinition, outcome: AudioQATestOutcome) -> [String] {
         beginTestContextIfNeeded(for: test)
         recordTestEvent(for: test, "Recorded verdict: \(outcome.rawValue).", includeSnapshot: true)
@@ -602,6 +748,19 @@ final class AudioQAViewModel: ObservableObject {
         drainLogs()
         refreshState()
         return routeMatchesExpectation(for: test)
+    }
+
+    private func waitForAudioSessionRunning() async {
+        for _ in 0..<20 {
+            drainLogs()
+            refreshState()
+            if state.isRunning {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        drainLogs()
+        refreshState()
     }
 
     private func routeMatchesExpectation(for test: AudioQATestDefinition) -> Bool {
@@ -992,6 +1151,17 @@ struct AudioQATestView: View {
                     kind: .verdict
                 )
             ]
+        case .recordingCoverage:
+            return [
+                routeStep,
+                AudioQAStepDefinition(
+                    id: "recording-coverage",
+                    title: "Check Recording Coverage",
+                    detail: "Tap the button below. The app restarts recording, then verifies that captured PCM duration keeps up with the first three seconds after the session reports running.",
+                    actionTitle: "Run Recording Check",
+                    kind: .runRecordingCoverage
+                )
+            ]
         }
     }
 
@@ -1047,6 +1217,14 @@ struct AudioQATestView: View {
                 } else {
                     advanceToNextStep()
                 }
+            case .runRecordingCoverage:
+                if let message = await viewModel.runRecordingCoverageCheck(for: test) {
+                    stepMessage = message
+                    viewModel.recordResult(for: test, outcome: .failed)
+                } else {
+                    viewModel.recordResult(for: test, outcome: .passed)
+                }
+                advance()
             case .playTone:
                 if let message = await viewModel.verifyActiveRoute(for: test) {
                     stepMessage = message
