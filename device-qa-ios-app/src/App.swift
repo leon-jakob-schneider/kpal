@@ -236,6 +236,10 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     private var observerEventCount = 0
     private var lastObserverCapturedBytes: Int64 = 0
     private var firstObserverCaptureLogged = false
+    private var audioEngine: AudioEngine?
+    private var activeDuplex: AudioDuplex?
+    private var duplexTask: Task<Void, Never>?
+    private var closeDuplexSemaphore: DispatchSemaphore?
 
     override init() {
         super.init()
@@ -246,7 +250,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
 
     deinit {
         pollTask?.cancel()
-        device.audio.stop()
+        closeDuplexSemaphore?.signal()
     }
 
     nonisolated func onStateChanged(state: AudioSessionState) {
@@ -309,26 +313,30 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
             isPreparingSession = false
         }
 
-        let granted = await withCheckedContinuation { continuation in
-            device.audio.requestInputPermission { allowed in
-                continuation.resume(returning: allowed.boolValue)
-            }
+        let request: AudioEngineRequest
+        do {
+            request = try await device.audio.requestEngine()
+        } catch {
+            appendLog("Audio setup failed: \(error.localizedDescription)")
+            refreshState()
+            return false
         }
-        guard granted else {
+        guard !request.permissionDenied, let engine = request.engine else {
             appendLog("Microphone permission denied.")
             refreshState()
             return false
         }
 
         appendLog("Microphone permission granted.")
+        audioEngine = engine
         resetObserverCaptureTracking()
-        device.audio.start()
+        openDuplexScope(engine: engine)
         await waitForAudioSessionRunning()
         return state.isRunning
     }
 
     func stopSession() {
-        device.audio.stop()
+        closeDuplexScope()
         drainLogs()
         refreshState()
         peakInputLevelSinceCaptureReset = 0
@@ -350,7 +358,11 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         if let test {
             recordTestEvent(for: test, "Requested 440 Hz playback.", includeSnapshot: true)
         }
-        device.audio.playPcm16(
+        guard let duplex = activeDuplex else {
+            appendLog("Audio session is not ready for playback.")
+            return
+        }
+        duplex.playPcm16(
             bytes: Pcm16ToneGenerator.shared.sine(
                 frequencyHz: 440,
                 durationMillis: 1_500,
@@ -370,7 +382,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
             recordTestEvent(for: test, "Requested captured audio playback.", includeSnapshot: true)
         }
         drainCapture()
-        if captureBuffer.play(audio: device.audio) {
+        if let duplex = activeDuplex, captureBuffer.play(duplex: duplex) {
             playbackRequests += 1
         } else {
             appendLog("No captured PCM to play.")
@@ -581,10 +593,10 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     private func replaceEngine(policy: AudioEnginePolicy, reason: String) {
-        device.audio.stop()
-        resetObserverCaptureTracking()
+        stopSession()
         currentPolicy = policy
         device = Self.makeDevice(policy: policy, observer: self)
+        audioEngine = nil
         appendLog(
             "\(reason). preferSpeaker=\(policy.preferSpeaker) enableInput=\(policy.enableInput) preferBluetoothA2dpOutput=\(policy.preferBluetoothA2dpOutput)"
         )
@@ -610,7 +622,13 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
 
     private func refreshState() {
         drainCapture()
-        let stateValue = device.audio.currentState()
+        let stateValue = audioEngine?.currentState() ?? AudioSessionState(
+            isRunning: false,
+            inputLevel: 0,
+            capturedBytes: 0,
+            playedBytes: 0,
+            route: nil
+        )
         let route = stateValue.route
         state = AudioDiagnosticState(
             isRunning: stateValue.isRunning,
@@ -666,7 +684,54 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     private func drainCapture() {
-        captureBuffer.drainFrom(audio: device.audio)
+        if let activeDuplex {
+            captureBuffer.drainFrom(duplex: activeDuplex)
+        }
+    }
+
+    private func openDuplexScope(engine: AudioEngine) {
+        guard duplexTask == nil else {
+            return
+        }
+        duplexTask = Task.detached { [weak self] in
+            do {
+                try await engine.useDuplex { duplex in
+                    let semaphore = DispatchSemaphore(value: 0)
+                    Task { @MainActor in
+                        self?.activeDuplex = duplex
+                        self?.closeDuplexSemaphore = semaphore
+                        self?.refreshState()
+                    }
+                    semaphore.wait()
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.appendLog("Audio session failed: \(error.localizedDescription)")
+                }
+            }
+            await MainActor.run { [weak self] in
+                self?.activeDuplex = nil
+                self?.closeDuplexSemaphore = nil
+                self?.duplexTask = nil
+                self?.refreshState()
+            }
+        }
+    }
+
+    private func waitForDuplexReady() async {
+        for _ in 0..<20 {
+            if activeDuplex != nil {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private func closeDuplexScope() {
+        let semaphore = closeDuplexSemaphore
+        closeDuplexSemaphore = nil
+        activeDuplex = nil
+        semaphore?.signal()
     }
 
     private func appendLog(_ message: String) {

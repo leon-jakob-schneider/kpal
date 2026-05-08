@@ -38,12 +38,14 @@ import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSProcessInfo
 import kotlin.math.ceil
 import kotlin.math.sqrt
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 @OptIn(ExperimentalForeignApi::class)
 class IosAudioEngine(
     private val observer: AudioSessionObserver? = null,
     private val config: AudioSessionConfig = AudioSessionConfig(),
-) : AudioEngine {
+) : Audio, AudioEngine, AudioDuplex {
     private val playbackFormat = AVAudioFormat(
         commonFormat = platform.AVFAudio.AVAudioPCMFormatFloat32,
         sampleRate = config.sampleRate.toDouble(),
@@ -75,14 +77,29 @@ class IosAudioEngine(
     private val notificationTokens = mutableListOf<Any>()
     private var reconfiguringRoute = false
 
-    override fun requestInputPermission(onResult: (Boolean) -> Unit) {
+    override suspend fun requestEngine(): AudioEngineRequest = suspendCoroutine { continuation ->
         val session = AVAudioSession.sharedInstance()
         session.requestRecordPermission { granted ->
-            onResult(granted)
+            continuation.resume(
+                if (granted) {
+                    AudioEngineRequest(engine = this)
+                } else {
+                    AudioEngineRequest(permissionDenied = true)
+                }
+            )
         }
     }
 
-    override fun start() {
+    override suspend fun useDuplex(block: (AudioDuplex) -> Unit) {
+        start()
+        try {
+            block(this)
+        } finally {
+            stop()
+        }
+    }
+
+    private fun start() {
         if (audioGraphStarted) {
             emitLog("Start ignored because the iOS engine is already running.")
             return
@@ -151,7 +168,7 @@ class IosAudioEngine(
         }
     }
 
-    override fun stop() {
+    private fun stop() {
         audioGraphStarted = false
         captureReady = false
         cleanupAudioGraph()
