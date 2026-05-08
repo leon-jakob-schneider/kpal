@@ -58,6 +58,8 @@ interface AudioEngine {
 }
 
 interface AudioDuplex {
+    fun restart()
+
     fun playPcm16(bytes: ByteArray)
 
     fun takeNextInputPcm16(): ByteArray?
