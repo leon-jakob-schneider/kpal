@@ -290,12 +290,17 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
             recordTestEvent(for: test, "Audio session already running. Restarting before test.")
             stopSession()
         }
-        let ready = await ensureSessionReady()
+        let requiresCaptureReady = test.kind != .recordingCoverage
+        let ready = await ensureSessionReady(requireCaptureReady: requiresCaptureReady)
         guard ready else {
             recordTestEvent(for: test, "Audio session failed to start.", includeSnapshot: true)
             return false
         }
-        recordTestEvent(for: test, "Audio session ready.", includeSnapshot: true)
+        if requiresCaptureReady {
+            recordTestEvent(for: test, "Audio session ready.", includeSnapshot: true)
+        } else {
+            recordTestEvent(for: test, "Audio duplex ready for recording coverage restart.", includeSnapshot: true)
+        }
         if test.kind == .capturedLoopback {
             clearCapture(for: test)
             appendLog("Cleared capture buffer for \(test.title).")
@@ -303,8 +308,8 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         return true
     }
 
-    func ensureSessionReady() async -> Bool {
-        if state.isRunning {
+    func ensureSessionReady(requireCaptureReady: Bool = true) async -> Bool {
+        if isAudioSessionReady(requireCaptureReady: requireCaptureReady) {
             return true
         }
 
@@ -330,9 +335,13 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         appendLog("Microphone permission granted.")
         audioEngine = engine
         resetObserverCaptureTracking()
+        await waitForDuplexClosed()
         openDuplexScope(engine: engine)
-        await waitForAudioSessionRunning()
-        return state.isRunning
+        await waitForAudioSessionRunning(requireCaptureReady: requireCaptureReady)
+        if !isAudioSessionReady(requireCaptureReady: requireCaptureReady) {
+            appendLog("Audio session did not become ready before timeout. \(compactDiagnosticSummary())")
+        }
+        return isAudioSessionReady(requireCaptureReady: requireCaptureReady)
     }
 
     func stopSession() {
@@ -440,12 +449,18 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     func runRecordingCoverageCheck(for test: AudioQATestDefinition) async -> String? {
-        recordTestEvent(for: test, "Restarting audio session for recording coverage timing.", includeSnapshot: true)
-        stopSession()
+        recordTestEvent(for: test, "Restarting active duplex for recording coverage timing.", includeSnapshot: true)
 
-        let ready = await ensureSessionReady()
-        guard ready else {
-            let message = "Audio setup failed. Check microphone permission and try again."
+        guard let duplex = activeDuplex else {
+            let message = "Audio session is not ready for restart. Go back and prepare the test again."
+            recordTestEvent(for: test, message, includeSnapshot: true)
+            return message
+        }
+        resetObserverCaptureTracking()
+        duplex.restart()
+        await waitForAudioSessionRunning(requireCaptureReady: true)
+        guard isAudioSessionReady else {
+            let message = "Audio restart did not become ready. Check the diagnostics log and try again."
             recordTestEvent(for: test, message, includeSnapshot: true)
             return message
         }
@@ -727,10 +742,20 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         }
     }
 
+    private func waitForDuplexClosed() async {
+        for _ in 0..<20 {
+            if duplexTask == nil {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
     private func closeDuplexScope() {
         let semaphore = closeDuplexSemaphore
         closeDuplexSemaphore = nil
         activeDuplex = nil
+        audioEngine = nil
         semaphore?.signal()
     }
 
@@ -770,7 +795,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     private func compactDiagnosticSummary() -> String {
-        "running=\(state.isRunning) input=\(state.inputRoute) output=\(state.outputRoute) sampleRate=\(Int(state.sampleRate))Hz ioBuffer=\(String(format: "%.2f", state.ioBufferMillis))ms inputLevel=\(String(format: "%.3f", state.inputLevel)) capturedBytes=\(state.capturedBytes) playedBytes=\(state.playedBytes) playbackRequests=\(state.playbackRequests)"
+        "running=\(state.isRunning) duplexActive=\(activeDuplex != nil) input=\(state.inputRoute) output=\(state.outputRoute) sampleRate=\(Int(state.sampleRate))Hz ioBuffer=\(String(format: "%.2f", state.ioBufferMillis))ms inputLevel=\(String(format: "%.3f", state.inputLevel)) capturedBytes=\(state.capturedBytes) playedBytes=\(state.playedBytes) playbackRequests=\(state.playbackRequests)"
     }
 
     private func capturedMillis(fromBytes bytes: Int64) -> Double {
@@ -815,17 +840,25 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         return routeMatchesExpectation(for: test)
     }
 
-    private func waitForAudioSessionRunning() async {
+    private func waitForAudioSessionRunning(requireCaptureReady: Bool = true) async {
         for _ in 0..<20 {
             drainLogs()
             refreshState()
-            if state.isRunning {
+            if isAudioSessionReady(requireCaptureReady: requireCaptureReady) {
                 return
             }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         drainLogs()
         refreshState()
+    }
+
+    private var isAudioSessionReady: Bool {
+        isAudioSessionReady(requireCaptureReady: true)
+    }
+
+    private func isAudioSessionReady(requireCaptureReady: Bool) -> Bool {
+        activeDuplex != nil && (!requireCaptureReady || state.isRunning)
     }
 
     private func routeMatchesExpectation(for test: AudioQATestDefinition) -> Bool {
@@ -846,6 +879,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     private func diagnosticSnapshotText() -> String {
         """
         running: \(state.isRunning)
+        duplexActive: \(activeDuplex != nil)
         capturedBytes: \(state.capturedBytes)
         playedBytes: \(state.playedBytes)
         playbackRequests: \(state.playbackRequests)

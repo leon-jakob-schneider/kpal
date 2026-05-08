@@ -98,6 +98,11 @@ class AndroidAudioEngine(
         updateRoute("Stopped")
     }
 
+    override fun restart() {
+        stop()
+        start()
+    }
+
     override fun playPcm16(bytes: ByteArray) {
         if (bytes.isEmpty()) {
             return

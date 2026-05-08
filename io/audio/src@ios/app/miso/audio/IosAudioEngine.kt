@@ -157,7 +157,7 @@ class IosAudioEngine(
                 return@runCatching
             }
             audioGraphStarted = true
-            captureReady = !this.config.enableInput
+            captureReady = captureReady || !this.config.enableInput
             updateRoute("Started AVAudioEngine full-duplex audio session")
         }.onFailure { error ->
             audioGraphStarted = false
@@ -179,6 +179,45 @@ class IosAudioEngine(
         inputLevel = 0f
         updateRoute("Stopped")
         emitLog("Stopped and deactivated AVAudioSession.")
+    }
+
+    override fun restart() {
+        val engine = audioEngine
+        val player = playerNode
+        if (engine == null || player == null || !audioGraphStarted) {
+            emitLog("Ignored duplex restart because the iOS audio graph is not running.")
+            emitState("Duplex restart ignored")
+            return
+        }
+
+        withLock {
+            pendingCapturedChunks.clear()
+            capturedBytes = 0
+            captureCallbacks = 0
+            convertedChunks = 0
+            captureReady = !config.enableInput
+        }
+        inputLevel = 0f
+
+        runCatching {
+            player.stop()
+            player.reset()
+            engine.stop()
+            engine.prepare()
+            if (!startAudioGraph(reason = "duplex restart")) {
+                audioGraphStarted = false
+                captureReady = false
+                updateRoute("Duplex restart failed")
+                return@runCatching
+            }
+            audioGraphStarted = true
+            emitLog("Restarted iOS duplex audio graph without deactivating AVAudioSession.")
+            updateRoute("Restarted duplex audio graph")
+        }.onFailure { error ->
+            audioGraphStarted = false
+            captureReady = false
+            emitError(error.message ?: "iOS duplex restart failed.")
+        }
     }
 
     override fun playPcm16(bytes: ByteArray) {
@@ -404,7 +443,7 @@ class IosAudioEngine(
                 return@runCatching
             }
             audioGraphStarted = true
-            captureReady = !config.enableInput
+            captureReady = captureReady || !config.enableInput
             updateRoute("Restarted audio graph")
         }.onFailure { error ->
             audioGraphStarted = false
