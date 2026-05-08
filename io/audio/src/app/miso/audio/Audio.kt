@@ -42,15 +42,22 @@ data class AudioError(
     val message: String,
 )
 
+interface Audio {
+    suspend fun requestEngine(): AudioEngineRequest
+}
+
+data class AudioEngineRequest(
+    val engine: AudioEngine? = null,
+    val permissionDenied: Boolean = false,
+)
+
 interface AudioEngine {
-    fun requestInputPermission(onResult: (Boolean) -> Unit)
-
-    fun start()
-
-    fun stop()
-
     fun currentState(): AudioSessionState
 
+    suspend fun useDuplex(block: (AudioDuplex) -> Unit)
+}
+
+interface AudioDuplex {
     fun playPcm16(bytes: ByteArray)
 
     fun takeNextInputPcm16(): ByteArray?
@@ -138,19 +145,19 @@ class AudioCaptureBuffer(maxBytes: Int = Int.MAX_VALUE) {
         buffer.clear()
     }
 
-    fun drainFrom(audio: AudioEngine) {
+    fun drainFrom(duplex: AudioDuplex) {
         while (true) {
-            val chunk = audio.takeNextInputPcm16() ?: return
+            val chunk = duplex.takeNextInputPcm16() ?: return
             buffer.append(chunk)
         }
     }
 
-    fun play(audio: AudioEngine): Boolean {
+    fun play(duplex: AudioDuplex): Boolean {
         val bytes = buffer.snapshot()
         if (bytes.isEmpty()) {
             return false
         }
-        audio.playPcm16(bytes)
+        duplex.playPcm16(bytes)
         return true
     }
 }

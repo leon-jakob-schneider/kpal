@@ -17,6 +17,8 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import app.miso.audio.AudioCaptureBuffer
+import app.miso.audio.AudioDuplex
+import app.miso.audio.AudioEngine
 import app.miso.audio.AudioError
 import app.miso.audio.AudioSessionConfig
 import app.miso.audio.AudioSessionObserver
@@ -27,6 +29,10 @@ import app.miso.device.DeviceImpl
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.concurrent.thread
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.startCoroutine
 
 class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
     private lateinit var device: DeviceImpl
@@ -39,6 +45,9 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val logs = ArrayDeque<String>()
     private val captureBuffer = AudioCaptureBuffer(maxBytes = 24_000 * 2 * 20)
+    private val duplexLock = Object()
+    private var audioEngine: AudioEngine? = null
+    private var activeDuplex: AudioDuplex? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -55,12 +64,12 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
             ),
         )
         setContentView(createContent())
-        renderState(device.audio.currentState())
+        renderState(AudioSessionState())
         appendLog("Open this on a real Android device. Speak, play the tone, then compare route and level behavior.")
     }
 
     override fun onDestroy() {
-        device.audio.stop()
+        stopSession()
         super.onDestroy()
     }
 
@@ -68,7 +77,7 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_RECORD_AUDIO) {
             if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
-                device.audio.start()
+                startSession()
             } else {
                 appendLog("Microphone permission denied.")
             }
@@ -108,19 +117,25 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
 
         content.addView(button("Start Capture") {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                device.audio.start()
+                startSession()
             } else {
                 requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
             }
         })
-        content.addView(button("Stop") { device.audio.stop() })
+        content.addView(button("Stop") { stopSession() })
         content.addView(button("Play 440 Hz Tone") {
-            device.audio.playPcm16(Pcm16ToneGenerator.sine())
-            appendLog("Requested 440 Hz tone playback.")
+            val duplex = activeDuplex
+            if (duplex == null) {
+                appendLog("Start capture before playing audio.")
+            } else {
+                duplex.playPcm16(Pcm16ToneGenerator.sine())
+                appendLog("Requested 440 Hz tone playback.")
+            }
         })
         content.addView(button("Play Captured Audio") {
             drainCapture()
-            if (captureBuffer.play(device.audio)) {
+            val duplex = activeDuplex
+            if (duplex != null && captureBuffer.play(duplex)) {
                 appendLog("Requested captured PCM playback.")
             } else {
                 appendLog("No captured PCM to play.")
@@ -185,7 +200,59 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
     }
 
     private fun drainCapture() {
-        captureBuffer.drainFrom(device.audio)
+        activeDuplex?.let { captureBuffer.drainFrom(it) }
+    }
+
+    private fun startSession() {
+        if (activeDuplex != null) {
+            return
+        }
+        runSuspend {
+            val request = device.audio.requestEngine()
+            if (request.permissionDenied || request.engine == null) {
+                runOnUiThread { appendLog("Microphone permission denied.") }
+                return@runSuspend
+            }
+            val engine = request.engine ?: return@runSuspend
+            audioEngine = engine
+            engine.useDuplex { duplex ->
+                waitUntilStop(duplex)
+            }
+        }
+    }
+
+    private fun stopSession() {
+        synchronized(duplexLock) {
+            activeDuplex = null
+            duplexLock.notifyAll()
+        }
+    }
+
+    private fun waitUntilStop(duplex: AudioDuplex) {
+        synchronized(duplexLock) {
+            activeDuplex = duplex
+            runOnUiThread {
+                audioEngine?.currentState()?.let { renderState(it) }
+            }
+            while (activeDuplex === duplex) {
+                duplexLock.wait()
+            }
+        }
+        runOnUiThread {
+            audioEngine?.currentState()?.let { renderState(it) }
+        }
+    }
+
+    private fun runSuspend(block: suspend () -> Unit) {
+        thread(name = "audio-qa-duplex") {
+            block.startCoroutine(
+                Continuation(EmptyCoroutineContext) { result ->
+                    result.exceptionOrNull()?.let { error ->
+                        runOnUiThread { appendLog("ERROR: ${error.message ?: error::class.simpleName}") }
+                    }
+                },
+            )
+        }
     }
 
     private fun title(text: String): TextView = TextView(this).apply {
