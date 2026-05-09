@@ -20,3 +20,6 @@ project(":audio").projectDir = file("../io/audio")
 
 include(":device")
 project(":device").projectDir = file("../device")
+
+include(":simulator")
+project(":simulator").projectDir = file("../simulator")
