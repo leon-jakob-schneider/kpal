@@ -3,9 +3,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/leon-jakob-schneider/kpal/releases/latest">
-    <img src="https://img.shields.io/github/v/release/leon-jakob-schneider/kpal?label=latest%20release" alt="Latest release" />
-  </a>
   <a href="https://central.sonatype.com/artifact/io.github.leon-jakob-schneider.kpal/device">
     <img src="https://img.shields.io/maven-central/v/io.github.leon-jakob-schneider.kpal/device?label=maven%20central" alt="Maven Central" />
   </a>
