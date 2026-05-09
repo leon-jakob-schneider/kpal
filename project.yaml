@@ -1,5 +1,6 @@
 modules:
   - ./io/audio
   - ./device
+  - ./simulator
   - ./device-qa-android-app
   - ./device-qa-ios-app
