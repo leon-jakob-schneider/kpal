@@ -6,6 +6,9 @@
   <a href="https://github.com/leon-jakob-schneider/kpal/releases/latest">
     <img src="https://img.shields.io/github/v/release/leon-jakob-schneider/kpal?label=latest%20release" alt="Latest release" />
   </a>
+  <a href="https://central.sonatype.com/artifact/io.github.leon-jakob-schneider.kpal/device">
+    <img src="https://img.shields.io/maven-central/v/io.github.leon-jakob-schneider.kpal/device?label=maven%20central" alt="Maven Central" />
+  </a>
 </p>
 
 kpal gives you a cross-platform Kotlin API for device features, then hardens that API with manual QA apps and a device simulator. Use the QA apps when behavior must be proven on real Android and iOS hardware, and use the simulator for cheap integration tests that run quickly in coding-agent feedback loops without a real device or human intervention.
