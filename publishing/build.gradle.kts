@@ -34,6 +34,7 @@ data class ModuleSpec(
     val artifactId: String,
     val description: String,
     val namespace: String,
+    val publishJvm: Boolean = false,
     val projectDependencies: List<String> = emptyList(),
 )
 
@@ -42,11 +43,13 @@ val moduleSpecs = mapOf(
         artifactId = "audio",
         description = "Shared Kotlin Multiplatform audio diagnostics and audio I/O abstractions.",
         namespace = "app.miso.audio",
+        publishJvm = true,
     ),
     "device" to ModuleSpec(
         artifactId = "device",
         description = "Shared Kotlin Multiplatform device facade built on top of the audio module.",
         namespace = "app.miso.device",
+        publishJvm = true,
         projectDependencies = listOf(":audio"),
     ),
     "simulator" to ModuleSpec(
@@ -74,6 +77,9 @@ subprojects {
         androidTarget {
             publishLibraryVariants("release")
         }
+        if (spec.publishJvm) {
+            jvm()
+        }
         iosArm64()
         iosSimulatorArm64()
         iosX64()
@@ -93,6 +99,11 @@ subprojects {
             }
             val androidMain by getting {
                 kotlin.srcDir(projectDir.resolve("src@android"))
+            }
+            if (spec.publishJvm) {
+                val jvmMain by getting {
+                    kotlin.srcDir(projectDir.resolve("src@jvm"))
+                }
             }
             val iosMain = maybeCreate("iosMain").apply {
                 dependsOn(commonMain)
