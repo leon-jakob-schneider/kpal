@@ -56,6 +56,7 @@ val moduleSpecs = mapOf(
         artifactId = "simulator",
         description = "Shared Kotlin Multiplatform simulator implementation of the device facade for unit tests.",
         namespace = "app.miso.simulator",
+        publishJvm = true,
         projectDependencies = listOf(":audio", ":device"),
     ),
 )
