@@ -63,7 +63,7 @@ engine.useDuplex { duplex ->
 }
 ```
 
-On Android, pass an Android `Context` as `platformContext`. On iOS, `platformContext` can stay `null`.
+On Android, pass an Android `Context` as `platformContext`. On iOS and JVM desktop, `platformContext` can stay `null`.
 
 ## Observe Audio State
 
@@ -194,6 +194,12 @@ Build the shared device library:
 
 ```bash
 ./amper build -m device
+```
+
+Build the JVM desktop device library:
+
+```bash
+./amper build -m device -p jvm
 ```
 
 Build the simulator:
