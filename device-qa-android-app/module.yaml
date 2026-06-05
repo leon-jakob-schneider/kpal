@@ -3,6 +3,7 @@ product: android/app
 dependencies:
   - ../device
   - ../io/audio
+  - org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2
 
 settings:
   kotlin:

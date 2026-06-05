@@ -4,6 +4,9 @@ import app.miso.audio.Audio
 import app.miso.audio.AudioDuplex
 import app.miso.audio.AudioEngine
 import app.miso.audio.AudioEngineRequest
+import app.miso.audio.AudioDuplexException
+import app.miso.audio.AudioException
+import app.miso.audio.AudioInputException
 import app.miso.audio.AudioRoute
 import app.miso.audio.AudioSessionConfig
 import app.miso.audio.AudioSessionObserver
@@ -11,7 +14,13 @@ import app.miso.audio.AudioSessionState
 import app.miso.audio.Pcm16Buffer
 import app.miso.device.Device
 import app.miso.device.DeviceConfig
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.math.sqrt
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class DeviceSimulator(
     config: DeviceConfig = DeviceConfig(),
@@ -52,6 +61,7 @@ class SimulatedAudio(
     private val observer: AudioSessionObserver? = null,
 ) : Audio, AudioEngine, AudioDuplex {
     private val pendingInputChunks = ArrayDeque<ByteArray>()
+    private val pendingInputContinuations = ArrayDeque<CancellableContinuation<ByteArray>>()
     private val capturedOutputChunks = ArrayDeque<ByteArray>()
     private val capturedOutputBuffer = Pcm16Buffer()
 
@@ -80,12 +90,14 @@ class SimulatedAudio(
         route = routeSnapshot(),
     )
 
-    override fun restart() {
+    override suspend fun restart() {
+        currentCoroutineContext().ensureActive()
         stop()
         start()
     }
 
-    override fun playPcm16(bytes: ByteArray) {
+    override suspend fun playPcm16(bytes: ByteArray) {
+        currentCoroutineContext().ensureActive()
         if (bytes.isEmpty()) {
             return
         }
@@ -96,12 +108,40 @@ class SimulatedAudio(
         emitState()
     }
 
-    override fun takeNextInputPcm16(): ByteArray? {
-        val chunk = pendingInputChunks.removeFirstOrNull() ?: return null
-        capturedBytes += chunk.size.toLong()
+    override suspend fun takeNextInputPcm16(): ByteArray {
+        currentCoroutineContext().ensureActive()
+        if (!config.enableInput) {
+            throw AudioInputException("Simulated audio input is disabled.")
+        }
+        val chunk = pendingInputChunks.removeFirstOrNull()
+        if (chunk != null) {
+            capturedBytes += chunk.size.toLong()
+            inputLevel = calculatePcm16Level(chunk)
+            emitState()
+            return chunk.copyOf()
+        }
+        if (!running) {
+            throw AudioDuplexException("Simulated audio duplex is not running.")
+        }
+        return suspendCancellableCoroutine { continuation ->
+            pendingInputContinuations.addLast(continuation)
+            continuation.invokeOnCancellation {
+                pendingInputContinuations.remove(continuation)
+            }
+        }
+    }
+
+    private fun deliverInputChunk(chunk: ByteArray) {
+        val continuation = pendingInputContinuations.removeFirstOrNull()
         inputLevel = calculatePcm16Level(chunk)
-        emitState()
-        return chunk.copyOf()
+        if (continuation != null) {
+            capturedBytes += chunk.size.toLong()
+            emitState()
+            continuation.resume(chunk.copyOf())
+        } else {
+            pendingInputChunks.addLast(chunk.copyOf())
+            emitState()
+        }
     }
 
     fun setInputPcm16(bytes: ByteArray) {
@@ -113,9 +153,7 @@ class SimulatedAudio(
         if (bytes.isEmpty()) {
             return
         }
-        pendingInputChunks.addLast(bytes.copyOf())
-        inputLevel = calculatePcm16Level(bytes)
-        emitState()
+        deliverInputChunk(bytes)
     }
 
     fun takeNextOutputPcm16(): ByteArray? = capturedOutputChunks.removeFirstOrNull()?.copyOf()
@@ -128,6 +166,7 @@ class SimulatedAudio(
 
     fun clearInput() {
         pendingInputChunks.clear()
+        cancelInputReaders(AudioInputException("Simulated audio input was cleared."))
         inputLevel = 0f
         emitState()
     }
@@ -155,8 +194,16 @@ class SimulatedAudio(
             return
         }
         running = false
+        cancelInputReaders(AudioDuplexException("Simulated audio duplex stopped."))
         inputLevel = 0f
         emitState()
+    }
+
+    private fun cancelInputReaders(error: AudioException) {
+        while (true) {
+            val continuation = pendingInputContinuations.removeFirstOrNull() ?: return
+            continuation.resumeWithException(error)
+        }
     }
 
     private fun routeSnapshot(): AudioRoute {

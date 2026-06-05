@@ -1,5 +1,6 @@
 package app.miso.audio
 
+import kotlinx.coroutines.CancellationException
 import kotlin.math.PI
 import kotlin.math.sin
 
@@ -42,7 +43,28 @@ data class AudioError(
     val message: String,
 )
 
+open class AudioException(
+    message: String,
+    cause: Throwable? = null,
+) : Exception(message, cause)
+
+class AudioStartupException(
+    message: String,
+    cause: Throwable? = null,
+) : AudioException(message, cause)
+
+class AudioDuplexException(
+    message: String,
+    cause: Throwable? = null,
+) : AudioException(message, cause)
+
+class AudioInputException(
+    message: String,
+    cause: Throwable? = null,
+) : AudioException(message, cause)
+
 interface Audio {
+    @Throws(AudioException::class, CancellationException::class)
     suspend fun requestEngine(): AudioEngineRequest
 }
 
@@ -54,15 +76,19 @@ data class AudioEngineRequest(
 interface AudioEngine {
     fun currentState(): AudioSessionState
 
+    @Throws(AudioException::class, CancellationException::class)
     suspend fun useDuplex(block: (AudioDuplex) -> Unit)
 }
 
 interface AudioDuplex {
-    fun restart()
+    @Throws(AudioException::class, CancellationException::class)
+    suspend fun restart()
 
-    fun playPcm16(bytes: ByteArray)
+    @Throws(AudioException::class, CancellationException::class)
+    suspend fun playPcm16(bytes: ByteArray)
 
-    fun takeNextInputPcm16(): ByteArray?
+    @Throws(AudioException::class, CancellationException::class)
+    suspend fun takeNextInputPcm16(): ByteArray
 }
 
 class Pcm16Buffer(private val maxBytes: Int = Int.MAX_VALUE) {
@@ -147,14 +173,17 @@ class AudioCaptureBuffer(maxBytes: Int = Int.MAX_VALUE) {
         buffer.clear()
     }
 
-    fun drainFrom(duplex: AudioDuplex) {
-        while (true) {
-            val chunk = duplex.takeNextInputPcm16() ?: return
-            buffer.append(chunk)
-        }
+    fun append(chunk: ByteArray) {
+        buffer.append(chunk)
     }
 
-    fun play(duplex: AudioDuplex): Boolean {
+    @Throws(AudioException::class, CancellationException::class)
+    suspend fun appendNextFrom(duplex: AudioDuplex) {
+        buffer.append(duplex.takeNextInputPcm16())
+    }
+
+    @Throws(AudioException::class, CancellationException::class)
+    suspend fun play(duplex: AudioDuplex): Boolean {
         val bytes = buffer.snapshot()
         if (bytes.isEmpty()) {
             return false

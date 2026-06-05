@@ -26,6 +26,7 @@ import app.miso.audio.AudioSessionState
 import app.miso.audio.Pcm16ToneGenerator
 import app.miso.device.DeviceConfig
 import app.miso.device.DeviceImpl
+import kotlinx.coroutines.runBlocking
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -128,17 +129,27 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
             if (duplex == null) {
                 appendLog("Start capture before playing audio.")
             } else {
-                duplex.playPcm16(Pcm16ToneGenerator.sine())
-                appendLog("Requested 440 Hz tone playback.")
+                runSuspend {
+                    duplex.playPcm16(Pcm16ToneGenerator.sine())
+                    runOnUiThread { appendLog("Requested 440 Hz tone playback.") }
+                }
             }
         })
         content.addView(button("Play Captured Audio") {
-            drainCapture()
             val duplex = activeDuplex
-            if (duplex != null && captureBuffer.play(duplex)) {
-                appendLog("Requested captured PCM playback.")
-            } else {
+            if (duplex == null) {
                 appendLog("No captured PCM to play.")
+            } else {
+                runSuspend {
+                    val played = captureBuffer.play(duplex)
+                    runOnUiThread {
+                        if (played) {
+                            appendLog("Requested captured PCM playback.")
+                        } else {
+                            appendLog("No captured PCM to play.")
+                        }
+                    }
+                }
             }
         })
         content.addView(button("Clear Capture") {
@@ -164,7 +175,6 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
     }
 
     private fun renderState(state: AudioSessionState) {
-        drainCapture()
         statusView.text = """
             running: ${state.isRunning}
             qaCapturedBytes: ${captureBuffer.sizeBytes}
@@ -199,10 +209,6 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
         logView.text = logs.joinToString(separator = "\n")
     }
 
-    private fun drainCapture() {
-        activeDuplex?.let { captureBuffer.drainFrom(it) }
-    }
-
     private fun startSession() {
         if (activeDuplex != null) {
             return
@@ -216,7 +222,9 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
             val engine = request.engine ?: return@runSuspend
             audioEngine = engine
             engine.useDuplex { duplex ->
-                waitUntilStop(duplex)
+                runBlocking {
+                    captureUntilStop(duplex)
+                }
             }
         }
     }
@@ -228,18 +236,35 @@ class DeviceQaAndroidAppActivity : Activity(), AudioSessionObserver {
         }
     }
 
-    private fun waitUntilStop(duplex: AudioDuplex) {
+    private suspend fun captureUntilStop(duplex: AudioDuplex) {
         synchronized(duplexLock) {
             activeDuplex = duplex
             runOnUiThread {
                 audioEngine?.currentState()?.let { renderState(it) }
             }
-            while (activeDuplex === duplex) {
-                duplexLock.wait()
-            }
         }
-        runOnUiThread {
-            audioEngine?.currentState()?.let { renderState(it) }
+        try {
+            while (true) {
+                synchronized(duplexLock) {
+                    if (activeDuplex !== duplex) {
+                        return
+                    }
+                }
+                val chunk = duplex.takeNextInputPcm16()
+                synchronized(duplexLock) {
+                    if (activeDuplex !== duplex) {
+                        return
+                    }
+                    captureBuffer.append(chunk)
+                }
+                runOnUiThread {
+                    audioEngine?.currentState()?.let { renderState(it) }
+                }
+            }
+        } finally {
+            runOnUiThread {
+                audioEngine?.currentState()?.let { renderState(it) }
+            }
         }
     }
 

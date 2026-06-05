@@ -36,9 +36,16 @@ import platform.Foundation.NSNotification
 import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSProcessInfo
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.math.ceil
 import kotlin.math.sqrt
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 
 @OptIn(ExperimentalForeignApi::class)
@@ -74,8 +81,12 @@ class IosAudioEngine(
     private var lastRoute: AudioRoute? = null
     private var lastMessage = "Idle"
     private val pendingCapturedChunks = ArrayDeque<ByteArray>()
+    private val pendingInputContinuations = ArrayDeque<CancellableContinuation<ByteArray>>()
     private val notificationTokens = mutableListOf<Any>()
     private var reconfiguringRoute = false
+    private var readySignal: CompletableDeferred<Unit>? = null
+    private var failureSignal: CompletableDeferred<AudioException>? = null
+    private var duplexError: AudioException? = null
 
     override suspend fun requestEngine(): AudioEngineRequest = suspendCoroutine { continuation ->
         val session = AVAudioSession.sharedInstance()
@@ -93,7 +104,9 @@ class IosAudioEngine(
     override suspend fun useDuplex(block: (AudioDuplex) -> Unit) {
         start()
         try {
+            awaitReadyOrFailure()
             block(this)
+            duplexError?.let { throw it }
         } finally {
             stop()
         }
@@ -104,8 +117,12 @@ class IosAudioEngine(
             emitLog("Start ignored because the iOS engine is already running.")
             return
         }
+        readySignal = CompletableDeferred()
+        failureSignal = CompletableDeferred()
+        duplexError = null
         withLock {
             pendingCapturedChunks.clear()
+            pendingInputContinuations.clear()
             capturedBytes = 0
             playedBytes = 0
             captureCallbacks = 0
@@ -142,35 +159,36 @@ class IosAudioEngine(
             playerNode = player
             if (this.config.enableInput) {
                 if (!installInputTap(engine.inputNode, session, reason = "initial start")) {
-                    audioGraphStarted = false
-                    captureReady = false
-                    cleanupAudioGraph()
-                    unregisterSessionObservers()
-                    return@runCatching
+                    throw AudioStartupException("iOS input tap could not be installed.")
                 }
             }
             if (!startAudioGraph(reason = "initial start")) {
-                audioGraphStarted = false
-                captureReady = false
-                cleanupAudioGraph()
-                unregisterSessionObservers()
-                return@runCatching
+                throw AudioStartupException("iOS audio graph could not be started.")
             }
             audioGraphStarted = true
             captureReady = captureReady || !this.config.enableInput
+            readySignal?.complete(Unit)
             updateRoute("Started AVAudioEngine full-duplex audio session")
         }.onFailure { error ->
+            val audioError = if (error is AudioException) {
+                error
+            } else {
+                AudioStartupException(error.message ?: "iOS audio session start failed.", error)
+            }
             audioGraphStarted = false
             captureReady = false
             cleanupAudioGraph()
             unregisterSessionObservers()
-            emitError(error.message ?: "iOS audio session start failed.")
+            emitError(audioError.message ?: "iOS audio session start failed.")
+            failDuplex(audioError)
+            throw audioError
         }
     }
 
     private fun stop() {
         audioGraphStarted = false
         captureReady = false
+        cancelInputReaders(AudioDuplexException("iOS audio duplex stopped."))
         cleanupAudioGraph()
         unregisterSessionObservers()
         val session = AVAudioSession.sharedInstance()
@@ -181,13 +199,15 @@ class IosAudioEngine(
         emitLog("Stopped and deactivated AVAudioSession.")
     }
 
-    override fun restart() {
+    override suspend fun restart() {
+        currentCoroutineContext().ensureActive()
         val engine = audioEngine
         val player = playerNode
         if (engine == null || player == null || !audioGraphStarted) {
-            emitLog("Ignored duplex restart because the iOS audio graph is not running.")
-            emitState("Duplex restart ignored")
-            return
+            val error = AudioDuplexException("Cannot restart because the iOS audio graph is not running.")
+            emitError(error.message ?: "iOS duplex restart failed.")
+            failDuplex(error)
+            throw error
         }
 
         withLock {
@@ -197,6 +217,7 @@ class IosAudioEngine(
             convertedChunks = 0
             captureReady = !config.enableInput
         }
+        readySignal = CompletableDeferred()
         inputLevel = 0f
 
         runCatching {
@@ -205,27 +226,34 @@ class IosAudioEngine(
             engine.stop()
             engine.prepare()
             if (!startAudioGraph(reason = "duplex restart")) {
-                audioGraphStarted = false
-                captureReady = false
-                updateRoute("Duplex restart failed")
-                return@runCatching
+                throw AudioDuplexException("iOS audio graph restart failed.")
             }
             audioGraphStarted = true
+            readySignal?.complete(Unit)
             emitLog("Restarted iOS duplex audio graph without deactivating AVAudioSession.")
             updateRoute("Restarted duplex audio graph")
         }.onFailure { error ->
+            val audioError = if (error is AudioException) {
+                error
+            } else {
+                AudioDuplexException(error.message ?: "iOS duplex restart failed.", error)
+            }
             audioGraphStarted = false
             captureReady = false
-            emitError(error.message ?: "iOS duplex restart failed.")
+            emitError(audioError.message ?: "iOS duplex restart failed.")
+            failDuplex(audioError)
+            throw audioError
         }
+        awaitReadyOrFailure()
     }
 
-    override fun playPcm16(bytes: ByteArray) {
+    override suspend fun playPcm16(bytes: ByteArray) {
+        currentCoroutineContext().ensureActive()
         if (bytes.isEmpty()) {
             emitLog("Ignored empty PCM16 playback request.")
             return
         }
-        val player = playerNode ?: return
+        val player = playerNode ?: throw AudioDuplexException("iOS audio output is not running.")
         val sampleCount = bytes.size / 2
         if (sampleCount <= 0) {
             return
@@ -245,6 +273,7 @@ class IosAudioEngine(
             player.play()
         }
         player.scheduleBuffer(buffer, completionHandler = null)
+        currentCoroutineContext().ensureActive()
         playedBytes += bytes.size.toLong()
         emitLog(
             "Scheduled playback request #$playbackRequests bytes=${bytes.size} samples=$sampleCount route=${routeSnapshot().output}"
@@ -260,8 +289,40 @@ class IosAudioEngine(
         route = routeSnapshot().also { lastRoute = it },
     )
 
-    override fun takeNextInputPcm16(): ByteArray? = withLock {
-        pendingCapturedChunks.removeFirstOrNull()
+    override suspend fun takeNextInputPcm16(): ByteArray {
+        currentCoroutineContext().ensureActive()
+        if (!config.enableInput) {
+            throw AudioInputException("iOS audio input is disabled.")
+        }
+        withLock {
+            duplexError?.let { throw it }
+            pendingCapturedChunks.removeFirstOrNull()?.let { return it }
+            if (!audioGraphStarted) {
+                throw AudioDuplexException("iOS audio duplex is not running.")
+            }
+        }
+        return suspendCancellableCoroutine { continuation ->
+            withLock {
+                duplexError?.let {
+                    continuation.resumeWithException(it)
+                    return@withLock
+                }
+                pendingCapturedChunks.removeFirstOrNull()?.let {
+                    continuation.resume(it)
+                    return@withLock
+                }
+                if (!audioGraphStarted) {
+                    continuation.resumeWithException(AudioDuplexException("iOS audio duplex is not running."))
+                    return@withLock
+                }
+                pendingInputContinuations.addLast(continuation)
+                continuation.invokeOnCancellation {
+                    withLock {
+                        pendingInputContinuations.remove(continuation)
+                    }
+                }
+            }
+        }
     }
 
     private fun configureAudioSession(session: AVAudioSession) {
@@ -444,6 +505,7 @@ class IosAudioEngine(
             }
             audioGraphStarted = true
             captureReady = captureReady || !config.enableInput
+            readySignal?.complete(Unit)
             updateRoute("Restarted audio graph")
         }.onFailure { error ->
             audioGraphStarted = false
@@ -474,12 +536,10 @@ class IosAudioEngine(
             return
         }
         convertedChunks += 1
-        withLock {
-            pendingCapturedChunks.addLast(bytes)
-            capturedBytes += bytes.size.toLong()
-        }
+        enqueueCapturedChunk(bytes)
         val becameReady = !captureReady
         captureReady = true
+        readySignal?.complete(Unit)
         if (convertedChunks == 1L) {
             emitLog("First converted capture chunk bytes=${bytes.size} inputLevel=$inputLevel.")
             emitState("First converted capture chunk")
@@ -602,11 +662,16 @@ class IosAudioEngine(
 
     private fun handleRouteChange(notification: NSNotification?) {
         val userInfoText = notification?.userInfo?.toString() ?: "none"
+        val reasonCode = routeChangeReasonCode(userInfoText)
         emitLog(
             "AVAudioSession route change notification reason=${routeChangeReasonDescription(userInfoText)} userInfo=$userInfoText"
         )
-        if (audioGraphStarted) {
-            restartAudioGraphAfterRouteChange(userInfoText)
+        if (audioGraphStarted && reasonCode != 3 && reasonCode != 4) {
+            val error = AudioDuplexException(
+                "iOS audio route changed during duplex session: ${routeChangeReasonDescription(userInfoText)}"
+            )
+            emitError(error.message ?: "iOS audio route changed during duplex session.")
+            failDuplex(error)
         } else {
             updateRoute("Route changed")
         }
@@ -615,7 +680,9 @@ class IosAudioEngine(
     private fun handleInterruption(notification: NSNotification?) {
         val userInfoText = notification?.userInfo?.toString() ?: "none"
         emitLog("AVAudioSession interruption notification userInfo=$userInfoText")
-        updateRoute("Session interrupted")
+        val error = AudioDuplexException("iOS audio session was interrupted: $userInfoText")
+        emitError(error.message ?: "iOS audio session was interrupted.")
+        failDuplex(error)
     }
 
     private fun routeSnapshot(): AudioRoute {
@@ -692,12 +759,7 @@ class IosAudioEngine(
     }
 
     private fun routeChangeReasonDescription(userInfoText: String): String {
-        val code = Regex("AVAudioSessionRouteChangeReasonKey=([0-9]+)")
-            .find(userInfoText)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.toIntOrNull()
-            ?: return "Unknown"
+        val code = routeChangeReasonCode(userInfoText) ?: return "Unknown"
         val label = when (code) {
             0 -> "Unknown"
             1 -> "NewDeviceAvailable"
@@ -710,6 +772,57 @@ class IosAudioEngine(
             else -> "Reason$code"
         }
         return "$label($code)"
+    }
+
+    private fun routeChangeReasonCode(userInfoText: String): Int? {
+        return Regex("AVAudioSessionRouteChangeReasonKey=([0-9]+)")
+            .find(userInfoText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+    }
+
+    private suspend fun awaitReadyOrFailure() {
+        val ready = readySignal ?: return
+        val failure = failureSignal ?: CompletableDeferred()
+        select {
+            ready.onAwait { }
+            failure.onAwait { error -> throw error }
+        }
+    }
+
+    private fun enqueueCapturedChunk(bytes: ByteArray) {
+        val continuation = withLock {
+            if (duplexError != null || !audioGraphStarted) {
+                return
+            }
+            capturedBytes += bytes.size.toLong()
+            pendingInputContinuations.removeFirstOrNull().also { continuation ->
+                if (continuation == null) {
+                    pendingCapturedChunks.addLast(bytes)
+                }
+            }
+        }
+        continuation?.resume(bytes)
+    }
+
+    private fun failDuplex(error: AudioException) {
+        duplexError = error
+        audioGraphStarted = false
+        captureReady = false
+        failureSignal?.complete(error)
+        cancelInputReaders(error)
+    }
+
+    private fun cancelInputReaders(error: AudioException) {
+        val continuations = withLock {
+            buildList {
+                while (true) {
+                    add(pendingInputContinuations.removeFirstOrNull() ?: break)
+                }
+            }
+        }
+        continuations.forEach { it.resumeWithException(error) }
     }
 
     private inline fun <T> withLock(block: () -> T): T {

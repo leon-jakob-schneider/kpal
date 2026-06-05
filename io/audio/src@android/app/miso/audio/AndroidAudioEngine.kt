@@ -9,8 +9,15 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.SystemClock
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.concurrent.thread
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.sqrt
 
@@ -42,6 +49,10 @@ class AndroidAudioEngine(
     private var captureThread: Thread? = null
     private val captureLock = Any()
     private val pendingCapturedChunks = ArrayDeque<ByteArray>()
+    private val pendingInputContinuations = ArrayDeque<CancellableContinuation<ByteArray>>()
+    private var readySignal: CompletableDeferred<Unit>? = null
+    private var failureSignal: CompletableDeferred<AudioException>? = null
+    private var duplexError: AudioException? = null
 
     override suspend fun requestEngine(): AudioEngineRequest = suspendCoroutine { continuation ->
         continuation.resume(AudioEngineRequest(engine = this))
@@ -50,7 +61,9 @@ class AndroidAudioEngine(
     override suspend fun useDuplex(block: (AudioDuplex) -> Unit) {
         start()
         try {
+            awaitReadyOrFailure()
             block(this)
+            duplexError?.let { throw it }
         } finally {
             stop()
         }
@@ -61,8 +74,12 @@ class AndroidAudioEngine(
             emitLog("Start ignored because the engine is already running.")
             return
         }
+        readySignal = CompletableDeferred()
+        failureSignal = CompletableDeferred()
+        duplexError = null
         synchronized(captureLock) {
             pendingCapturedChunks.clear()
+            pendingInputContinuations.clear()
             capturedBytes = 0
             playedBytes = 0
         }
@@ -78,10 +95,16 @@ class AndroidAudioEngine(
             track.play()
             updateRoute("Started full-duplex audio session")
             startCaptureLoop(record)
+            if (!config.enableInput) {
+                readySignal?.complete(Unit)
+            }
         }.onFailure { error ->
+            val audioError = AudioStartupException(error.message ?: "Android audio session start failed.", error)
             running = false
             cleanupAudio()
-            emitError(error.message ?: "Android audio session start failed.")
+            emitError(audioError.message ?: "Android audio session start failed.")
+            failDuplex(audioError)
+            throw audioError
         }
     }
 
@@ -92,25 +115,33 @@ class AndroidAudioEngine(
         running = false
         captureThread?.interrupt()
         captureThread = null
+        cancelInputReaders(AudioDuplexException("Android audio duplex stopped."))
         cleanupAudio()
         restoreAudioRoute()
         inputLevel = 0f
         updateRoute("Stopped")
     }
 
-    override fun restart() {
+    override suspend fun restart() {
+        currentCoroutineContext().ensureActive()
         stop()
         start()
+        awaitReadyOrFailure()
     }
 
-    override fun playPcm16(bytes: ByteArray) {
+    override suspend fun playPcm16(bytes: ByteArray) {
+        currentCoroutineContext().ensureActive()
         if (bytes.isEmpty()) {
             return
         }
-        val track = audioTrack ?: createAudioTrack().also { audioTrack = it; it.play() }
+        val track = audioTrack ?: throw AudioDuplexException("Android audio output is not running.")
         val written = track.write(bytes, 0, bytes.size)
         if (written > 0) {
             playedBytes += written.toLong()
+        } else {
+            val error = AudioDuplexException("Android audio output write failed: $written")
+            failDuplex(error)
+            throw error
         }
         emitState("Played PCM16 buffer")
     }
@@ -123,8 +154,40 @@ class AndroidAudioEngine(
         route = routeSnapshot().also { lastRoute = it },
     )
 
-    override fun takeNextInputPcm16(): ByteArray? = synchronized(captureLock) {
-        pendingCapturedChunks.removeFirstOrNull()
+    override suspend fun takeNextInputPcm16(): ByteArray {
+        currentCoroutineContext().ensureActive()
+        if (!config.enableInput) {
+            throw AudioInputException("Android audio input is disabled.")
+        }
+        synchronized(captureLock) {
+            duplexError?.let { throw it }
+            pendingCapturedChunks.removeFirstOrNull()?.let { return it }
+            if (!running) {
+                throw AudioDuplexException("Android audio duplex is not running.")
+            }
+        }
+        return suspendCancellableCoroutine { continuation ->
+            synchronized(captureLock) {
+                duplexError?.let {
+                    continuation.resumeWithException(it)
+                    return@synchronized
+                }
+                pendingCapturedChunks.removeFirstOrNull()?.let {
+                    continuation.resume(it)
+                    return@synchronized
+                }
+                if (!running) {
+                    continuation.resumeWithException(AudioDuplexException("Android audio duplex is not running."))
+                    return@synchronized
+                }
+                pendingInputContinuations.addLast(continuation)
+                continuation.invokeOnCancellation {
+                    synchronized(captureLock) {
+                        pendingInputContinuations.remove(continuation)
+                    }
+                }
+            }
+        }
     }
 
     private fun createAudioRecord(): AudioRecord {
@@ -180,17 +243,57 @@ class AndroidAudioEngine(
                 val read = record.read(buffer, 0, buffer.size)
                 if (read > 0) {
                     val chunk = buffer.copyOf(read)
-                    synchronized(captureLock) {
-                        pendingCapturedChunks.addLast(chunk)
-                        capturedBytes += read.toLong()
-                    }
                     inputLevel = calculatePcm16Level(chunk, read)
+                    enqueueCapturedChunk(chunk)
                     emitState("Capturing PCM input")
                 } else if (read < 0) {
-                    emitLog("AudioRecord read returned $read")
+                    failDuplex(AudioInputException("Android AudioRecord read failed: $read"))
                 }
             }
         }
+    }
+
+    private fun enqueueCapturedChunk(chunk: ByteArray) {
+        val continuation = synchronized(captureLock) {
+            if (!running || duplexError != null) {
+                return
+            }
+            capturedBytes += chunk.size.toLong()
+            pendingInputContinuations.removeFirstOrNull().also { continuation ->
+                if (continuation == null) {
+                    pendingCapturedChunks.addLast(chunk)
+                }
+            }
+        }
+        readySignal?.complete(Unit)
+        continuation?.resume(chunk)
+    }
+
+    private suspend fun awaitReadyOrFailure() {
+        val ready = readySignal ?: return
+        val failure = failureSignal ?: CompletableDeferred()
+        select {
+            ready.onAwait { }
+            failure.onAwait { error -> throw error }
+        }
+    }
+
+    private fun failDuplex(error: AudioException) {
+        duplexError = error
+        running = false
+        failureSignal?.complete(error)
+        cancelInputReaders(error)
+    }
+
+    private fun cancelInputReaders(error: AudioException) {
+        val continuations = synchronized(captureLock) {
+            buildList {
+                while (true) {
+                    add(pendingInputContinuations.removeFirstOrNull() ?: break)
+                }
+            }
+        }
+        continuations.forEach { it.resumeWithException(error) }
     }
 
     private fun calculatePcm16Level(bytes: ByteArray, byteCount: Int): Float {

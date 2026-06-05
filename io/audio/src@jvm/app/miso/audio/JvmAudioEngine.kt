@@ -7,7 +7,15 @@ import javax.sound.sampled.DataLine
 import javax.sound.sampled.LineUnavailableException
 import javax.sound.sampled.SourceDataLine
 import javax.sound.sampled.TargetDataLine
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.concurrent.thread
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.sqrt
 
 class JvmAudioEngine(
@@ -43,6 +51,10 @@ class JvmAudioEngine(
     )
     private val captureLock = Any()
     private val pendingCapturedChunks = ArrayDeque<ByteArray>()
+    private val pendingInputContinuations = ArrayDeque<CancellableContinuation<ByteArray>>()
+    private var readySignal: CompletableDeferred<Unit>? = null
+    private var failureSignal: CompletableDeferred<AudioException>? = null
+    private var duplexError: AudioException? = null
 
     private var targetLine: TargetDataLine? = null
     private var sourceLine: SourceDataLine? = null
@@ -64,7 +76,9 @@ class JvmAudioEngine(
     override suspend fun useDuplex(block: (AudioDuplex) -> Unit) {
         start()
         try {
+            awaitReadyOrFailure()
             block(this)
+            duplexError?.let { throw it }
         } finally {
             stop()
         }
@@ -78,34 +92,67 @@ class JvmAudioEngine(
         route = routeSnapshot().also { lastRoute = it },
     )
 
-    override fun restart() {
+    override suspend fun restart() {
+        currentCoroutineContext().ensureActive()
         stop()
         start()
+        awaitReadyOrFailure()
     }
 
-    override fun playPcm16(bytes: ByteArray) {
+    override suspend fun playPcm16(bytes: ByteArray) {
+        currentCoroutineContext().ensureActive()
         if (bytes.isEmpty()) {
             return
         }
 
-        val line = sourceLine ?: runCatching { createSourceLine() }
-            .onFailure { emitError(it.message ?: "Failed to create JVM desktop output line.") }
-            .getOrNull()
-            ?.also {
-                sourceLine = it
-                it.start()
-            }
-            ?: return
+        val line = sourceLine ?: throw AudioDuplexException("JVM desktop audio output is not running.")
 
         val written = line.write(bytes, 0, bytes.size)
+        currentCoroutineContext().ensureActive()
         if (written > 0) {
             playedBytes += written.toLong()
+        } else {
+            val error = AudioDuplexException("JVM desktop audio output write failed: $written")
+            failDuplex(error)
+            throw error
         }
         emitState("Played PCM16 buffer")
     }
 
-    override fun takeNextInputPcm16(): ByteArray? = synchronized(captureLock) {
-        pendingCapturedChunks.removeFirstOrNull()
+    override suspend fun takeNextInputPcm16(): ByteArray {
+        currentCoroutineContext().ensureActive()
+        if (!config.enableInput) {
+            throw AudioInputException("JVM desktop audio input is disabled.")
+        }
+        synchronized(captureLock) {
+            duplexError?.let { throw it }
+            pendingCapturedChunks.removeFirstOrNull()?.let { return it }
+            if (!running) {
+                throw AudioDuplexException("JVM desktop audio duplex is not running.")
+            }
+        }
+        return suspendCancellableCoroutine { continuation ->
+            synchronized(captureLock) {
+                duplexError?.let {
+                    continuation.resumeWithException(it)
+                    return@synchronized
+                }
+                pendingCapturedChunks.removeFirstOrNull()?.let {
+                    continuation.resume(it)
+                    return@synchronized
+                }
+                if (!running) {
+                    continuation.resumeWithException(AudioDuplexException("JVM desktop audio duplex is not running."))
+                    return@synchronized
+                }
+                pendingInputContinuations.addLast(continuation)
+                continuation.invokeOnCancellation {
+                    synchronized(captureLock) {
+                        pendingInputContinuations.remove(continuation)
+                    }
+                }
+            }
+        }
     }
 
     private fun start() {
@@ -113,9 +160,13 @@ class JvmAudioEngine(
             emitLog("Start ignored because the engine is already running.")
             return
         }
+        readySignal = CompletableDeferred()
+        failureSignal = CompletableDeferred()
+        duplexError = null
 
         synchronized(captureLock) {
             pendingCapturedChunks.clear()
+            pendingInputContinuations.clear()
             capturedBytes = 0
             playedBytes = 0
         }
@@ -132,11 +183,16 @@ class JvmAudioEngine(
             updateRoute("Started JVM desktop audio session")
             if (capture != null) {
                 startCaptureLoop(capture)
+            } else {
+                readySignal?.complete(Unit)
             }
         }.onFailure { error ->
+            val audioError = AudioStartupException(error.message ?: "JVM desktop audio session start failed.", error)
             running = false
             cleanupAudio()
-            emitError(error.message ?: "JVM desktop audio session start failed.")
+            emitError(audioError.message ?: "JVM desktop audio session start failed.")
+            failDuplex(audioError)
+            throw audioError
         }
     }
 
@@ -148,6 +204,7 @@ class JvmAudioEngine(
         running = false
         captureThread?.interrupt()
         captureThread = null
+        cancelInputReaders(AudioDuplexException("JVM desktop audio duplex stopped."))
         cleanupAudio()
         inputLevel = 0f
         updateRoute("Stopped")
@@ -180,15 +237,57 @@ class JvmAudioEngine(
                 val read = line.read(buffer, 0, buffer.size)
                 if (read > 0) {
                     val chunk = buffer.copyOf(read)
-                    synchronized(captureLock) {
-                        pendingCapturedChunks.addLast(chunk)
-                        capturedBytes += read.toLong()
-                    }
                     inputLevel = calculatePcm16Level(chunk, read)
+                    enqueueCapturedChunk(chunk)
                     emitState("Capturing PCM input")
+                } else if (read < 0) {
+                    failDuplex(AudioInputException("JVM desktop audio input read failed: $read"))
                 }
             }
         }
+    }
+
+    private suspend fun awaitReadyOrFailure() {
+        val ready = readySignal ?: return
+        val failure = failureSignal ?: CompletableDeferred()
+        select {
+            ready.onAwait { }
+            failure.onAwait { error -> throw error }
+        }
+    }
+
+    private fun enqueueCapturedChunk(chunk: ByteArray) {
+        val continuation = synchronized(captureLock) {
+            if (!running || duplexError != null) {
+                return
+            }
+            capturedBytes += chunk.size.toLong()
+            pendingInputContinuations.removeFirstOrNull().also { continuation ->
+                if (continuation == null) {
+                    pendingCapturedChunks.addLast(chunk)
+                }
+            }
+        }
+        readySignal?.complete(Unit)
+        continuation?.resume(chunk)
+    }
+
+    private fun failDuplex(error: AudioException) {
+        duplexError = error
+        running = false
+        failureSignal?.complete(error)
+        cancelInputReaders(error)
+    }
+
+    private fun cancelInputReaders(error: AudioException) {
+        val continuations = synchronized(captureLock) {
+            buildList {
+                while (true) {
+                    add(pendingInputContinuations.removeFirstOrNull() ?: break)
+                }
+            }
+        }
+        continuations.forEach { it.resumeWithException(error) }
     }
 
     private fun cleanupAudio() {
