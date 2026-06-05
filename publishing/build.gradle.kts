@@ -36,6 +36,7 @@ data class ModuleSpec(
     val namespace: String,
     val publishJvm: Boolean = false,
     val projectDependencies: List<String> = emptyList(),
+    val commonDependencies: List<String> = emptyList(),
 )
 
 val moduleSpecs = mapOf(
@@ -44,6 +45,7 @@ val moduleSpecs = mapOf(
         description = "Shared Kotlin Multiplatform audio diagnostics and audio I/O abstractions.",
         namespace = "app.miso.audio",
         publishJvm = true,
+        commonDependencies = listOf("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
     ),
     "device" to ModuleSpec(
         artifactId = "device",
@@ -95,6 +97,9 @@ subprojects {
                 dependencies {
                     spec.projectDependencies.forEach { dependencyPath ->
                         api(project(dependencyPath))
+                    }
+                    spec.commonDependencies.forEach { dependency ->
+                        api(dependency)
                     }
                 }
             }

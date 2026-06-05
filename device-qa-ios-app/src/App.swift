@@ -208,6 +208,36 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
             passTitle: "I heard my recorded voice in AirPods",
             failTitle: "I did not hear my recorded voice in AirPods"
         ),
+        AudioQATestDefinition(
+            id: "issue19-bluetooth-hfp-capture",
+            title: "Issue #19: Bluetooth HFP Capture",
+            summary: "Reproduce capture with preferSpeaker=false and voiceProcessing=true while Bluetooth HFP is available.",
+            kind: .capturedLoopback,
+            instructions: [
+                "Connect AirPods or another Bluetooth HFP device and keep it active.",
+                "The app starts duplex audio with preferSpeaker=false, voiceProcessing=true, 24 kHz, and a 1,024-frame buffer.",
+                "Speak toward the iPhone microphone, not the Bluetooth microphone, for three to five seconds.",
+                "A silent or unusable recording together with a BluetoothHFP input route reproduces issue #19 case 1."
+            ],
+            actionTitle: "Run Bluetooth HFP Capture",
+            passTitle: "Capture contained my voice",
+            failTitle: "Capture was silent or missing"
+        ),
+        AudioQATestDefinition(
+            id: "issue19-built-in-capture",
+            title: "Issue #19: Built-In Capture Startup",
+            summary: "Reproduce capture startup with preferSpeaker=true and voiceProcessing=true on the built-in mic and speaker.",
+            kind: .capturedLoopback,
+            instructions: [
+                "Disconnect AirPods and every other external audio device.",
+                "The app starts duplex audio with preferSpeaker=true, voiceProcessing=true, 24 kHz, and a 1,024-frame buffer.",
+                "Speak toward the iPhone microphone for three to five seconds.",
+                "A duplex scope that opens while running remains false and captured bytes remain zero reproduces issue #19 case 2."
+            ],
+            actionTitle: "Run Built-In Capture",
+            passTitle: "Capture started and contained my voice",
+            failTitle: "Capture never started or was silent"
+        ),
     ]
 
     private var device: DeviceImpl!
@@ -239,6 +269,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     private var audioEngine: AudioEngine?
     private var activeDuplex: AudioDuplex?
     private var duplexTask: Task<Void, Never>?
+    private var captureTask: Task<Void, Never>?
     private var closeDuplexSemaphore: DispatchSemaphore?
 
     override init() {
@@ -250,6 +281,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
 
     deinit {
         pollTask?.cancel()
+        captureTask?.cancel()
         closeDuplexSemaphore?.signal()
     }
 
@@ -281,14 +313,13 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         beginTestContextIfNeeded(for: test)
         recordTestEvent(
             for: test,
-            "Preparing audio session. kind=\(test.kind.rawValue) preferSpeaker=\(shouldPreferSpeaker(for: test))"
+            "Preparing audio session. kind=\(test.kind.rawValue) \(policySummary(policy(for: test)))"
         )
         let policy = policy(for: test)
         if policy != currentPolicy {
             replaceEngine(policy: policy, reason: "Switching audio policy for \(test.title)")
-        } else if state.isRunning {
-            recordTestEvent(for: test, "Audio session already running. Restarting before test.")
-            stopSession()
+        } else {
+            replaceEngine(policy: policy, reason: "Resetting audio engine for \(test.title)")
         }
         let requiresCaptureReady = test.kind != .recordingCoverage
         let ready = await ensureSessionReady(requireCaptureReady: requiresCaptureReady)
@@ -353,7 +384,6 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     func clearCapture(for test: AudioQATestDefinition? = nil) {
-        drainCapture()
         captureBuffer.clear()
         refreshState()
         peakInputLevelSinceCaptureReset = 0
@@ -363,7 +393,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         }
     }
 
-    func playTestTone(for test: AudioQATestDefinition? = nil) {
+    func playTestTone(for test: AudioQATestDefinition? = nil) async {
         if let test {
             recordTestEvent(for: test, "Requested 440 Hz playback.", includeSnapshot: true)
         }
@@ -371,34 +401,46 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
             appendLog("Audio session is not ready for playback.")
             return
         }
-        duplex.playPcm16(
-            bytes: Pcm16ToneGenerator.shared.sine(
-                frequencyHz: 440,
-                durationMillis: 1_500,
-                sampleRate: 24_000,
-                amplitude: 0.22
+        do {
+            try await duplex.playPcm16(
+                bytes: Pcm16ToneGenerator.shared.sine(
+                    frequencyHz: 440,
+                    durationMillis: 1_500,
+                    sampleRate: 24_000,
+                    amplitude: 0.22
+                )
             )
-        )
-        playbackRequests += 1
-        refreshState()
-        if let test {
-            recordTestEvent(for: test, "Playback request finished.", includeSnapshot: true)
+            playbackRequests += 1
+            refreshState()
+            if let test {
+                recordTestEvent(for: test, "Playback request finished.", includeSnapshot: true)
+            }
+        } catch {
+            appendLog("Playback failed: \(error.localizedDescription)")
         }
     }
 
-    func playCapturedAudio(for test: AudioQATestDefinition? = nil) {
+    func playCapturedAudio(for test: AudioQATestDefinition? = nil) async {
         if let test {
             recordTestEvent(for: test, "Requested captured audio playback.", includeSnapshot: true)
         }
-        drainCapture()
-        if let duplex = activeDuplex, captureBuffer.play(duplex: duplex) {
-            playbackRequests += 1
-        } else {
+        guard let duplex = activeDuplex else {
             appendLog("No captured PCM to play.")
+            return
         }
-        refreshState()
-        if let test {
-            recordTestEvent(for: test, "Captured audio playback request finished.", includeSnapshot: true)
+        do {
+            let played = try await captureBuffer.play(duplex: duplex)
+            if played.boolValue {
+                playbackRequests += 1
+            } else {
+                appendLog("No captured PCM to play.")
+            }
+            refreshState()
+            if let test {
+                recordTestEvent(for: test, "Captured audio playback request finished.", includeSnapshot: true)
+            }
+        } catch {
+            appendLog("Captured audio playback failed: \(error.localizedDescription)")
         }
     }
 
@@ -457,7 +499,13 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
             return message
         }
         resetObserverCaptureTracking()
-        duplex.restart()
+        do {
+            try await duplex.restart()
+        } catch {
+            let message = "Audio restart failed: \(error.localizedDescription)"
+            recordTestEvent(for: test, message, includeSnapshot: true)
+            return message
+        }
         await waitForAudioSessionRunning(requireCaptureReady: true)
         guard isAudioSessionReady else {
             let message = "Audio restart did not become ready. Check the diagnostics log and try again."
@@ -587,7 +635,11 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     private func shouldPreferSpeaker(for test: AudioQATestDefinition) -> Bool {
-        !test.id.contains("airpods")
+        !expectsBluetoothRoute(for: test)
+    }
+
+    private func expectsBluetoothRoute(for test: AudioQATestDefinition) -> Bool {
+        test.id.contains("airpods") || test.id == "issue19-bluetooth-hfp-capture"
     }
 
     private func policy(for test: AudioQATestDefinition) -> AudioEnginePolicy {
@@ -613,9 +665,13 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
         device = Self.makeDevice(policy: policy, observer: self)
         audioEngine = nil
         appendLog(
-            "\(reason). preferSpeaker=\(policy.preferSpeaker) enableInput=\(policy.enableInput) preferBluetoothA2dpOutput=\(policy.preferBluetoothA2dpOutput)"
+            "\(reason). \(policySummary(policy))"
         )
         refreshState()
+    }
+
+    private func policySummary(_ policy: AudioEnginePolicy) -> String {
+        "preferSpeaker=\(policy.preferSpeaker) voiceProcessing=\(policy.voiceProcessing) enableInput=\(policy.enableInput) preferBluetoothA2dpOutput=\(policy.preferBluetoothA2dpOutput) sampleRate=24000Hz ioBufferFrames=1024"
     }
 
     private static func makeDevice(policy: AudioEnginePolicy, observer: AudioSessionObserver?) -> DeviceImpl {
@@ -636,7 +692,6 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     private func refreshState() {
-        drainCapture()
         let stateValue = audioEngine?.currentState() ?? AudioSessionState(
             isRunning: false,
             inputLevel: 0,
@@ -695,13 +750,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     private func drainLogs() {
-        drainCapture()
-    }
-
-    private func drainCapture() {
-        if let activeDuplex {
-            captureBuffer.drainFrom(duplex: activeDuplex)
-        }
+        refreshState()
     }
 
     private func openDuplexScope(engine: AudioEngine) {
@@ -715,6 +764,12 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
                     Task { @MainActor in
                         self?.activeDuplex = duplex
                         self?.closeDuplexSemaphore = semaphore
+                        if self?.currentPolicy.enableInput == true {
+                            self?.startCaptureLoop(duplex: duplex)
+                        } else {
+                            self?.captureTask?.cancel()
+                            self?.captureTask = nil
+                        }
                         self?.refreshState()
                     }
                     semaphore.wait()
@@ -725,10 +780,43 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
                 }
             }
             await MainActor.run { [weak self] in
+                self?.captureTask?.cancel()
+                self?.captureTask = nil
                 self?.activeDuplex = nil
                 self?.closeDuplexSemaphore = nil
                 self?.duplexTask = nil
                 self?.refreshState()
+            }
+        }
+    }
+
+    private func startCaptureLoop(duplex: AudioDuplex) {
+        captureTask?.cancel()
+        captureTask = Task { [weak self] in
+            do {
+                while !Task.isCancelled {
+                    let chunk = try await duplex.takeNextInputPcm16()
+                    await MainActor.run { [weak self] in
+                        guard self?.activeDuplex != nil else {
+                            return
+                        }
+                        self?.captureBuffer.append(chunk: chunk)
+                        self?.refreshState()
+                    }
+                }
+            } catch is CancellationError {
+                // Expected when the duplex scope closes.
+            } catch {
+                if Task.isCancelled {
+                    return
+                }
+                await MainActor.run { [weak self] in
+                    guard let self = self, self.activeDuplex != nil else {
+                        return
+                    }
+                    self.appendLog("Audio capture failed: \(error.localizedDescription)")
+                    self.closeDuplexScope()
+                }
             }
         }
     }
@@ -743,7 +831,7 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
     }
 
     private func waitForDuplexClosed() async {
-        for _ in 0..<20 {
+        for _ in 0..<60 {
             if duplexTask == nil {
                 return
             }
@@ -753,9 +841,12 @@ final class AudioQAViewModel: NSObject, ObservableObject, AudioSessionObserver {
 
     private func closeDuplexScope() {
         let semaphore = closeDuplexSemaphore
+        captureTask?.cancel()
+        captureTask = nil
         closeDuplexSemaphore = nil
         activeDuplex = nil
         audioEngine = nil
+        duplexTask?.cancel()
         semaphore?.signal()
     }
 
@@ -1111,6 +1202,16 @@ struct AudioQATestView: View {
                 Text(test.summary)
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Procedure")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(test.instructions.enumerated()), id: \.offset) { index, instruction in
+                        Text("\(index + 1). \(instruction)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 HStack {
                     Button("End Run") {
                         exitRun()
@@ -1265,7 +1366,7 @@ struct AudioQATestView: View {
     }
 
     private var expectsAirPods: Bool {
-        test.id.contains("airpods")
+        test.id.contains("airpods") || test.id == "issue19-bluetooth-hfp-capture"
     }
 
     private var displayStepIndex: Int {
@@ -1329,14 +1430,14 @@ struct AudioQATestView: View {
                     stepMessage = message
                     return
                 }
-                viewModel.playTestTone(for: test)
+                await viewModel.playTestTone(for: test)
                 advanceToNextStep()
             case .playCapturedAudio:
                 if let message = await viewModel.verifyActiveRoute(for: test) {
                     stepMessage = message
                     return
                 }
-                viewModel.playCapturedAudio(for: test)
+                await viewModel.playCapturedAudio(for: test)
                 advanceToNextStep()
             case .verdict:
                 break

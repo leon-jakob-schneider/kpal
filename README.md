@@ -41,6 +41,7 @@ Create a platform device and request an audio engine:
 import app.miso.audio.AudioSessionConfig
 import app.miso.device.DeviceConfig
 import app.miso.device.DeviceImpl
+import kotlinx.coroutines.runBlocking
 
 val device = DeviceImpl(
     platformContext = platformContext,
@@ -58,10 +59,14 @@ val request = device.audio.requestEngine()
 val engine = request.engine ?: return
 
 engine.useDuplex { duplex ->
-    duplex.playPcm16(pcm16Bytes)
-    val inputChunk = duplex.takeNextInputPcm16()
+    runBlocking {
+        val inputChunk = duplex.takeNextInputPcm16()
+        duplex.playPcm16(inputChunk)
+    }
 }
 ```
+
+`useDuplex` calls its block only after the platform audio graph is ready. `AudioDuplex` functions are suspending and cancellation-aware, so bridge into a coroutine from the block before reading, writing, or restarting. `takeNextInputPcm16()` suspends until a PCM16 input chunk is available and throws if the duplex session fails; it does not use `null` to represent an empty queue.
 
 On Android, pass an Android `Context` as `platformContext`. On iOS and JVM desktop, `platformContext` can stay `null`.
 
@@ -113,6 +118,7 @@ Use `DeviceSimulator` when the code under test should exercise the same `Device`
 ```kotlin
 import app.miso.audio.Pcm16ToneGenerator
 import app.miso.simulator.DeviceSimulator
+import kotlinx.coroutines.runBlocking
 
 val device = DeviceSimulator()
 val input = Pcm16ToneGenerator.sine(durationMillis = 200)
@@ -121,10 +127,12 @@ device.setAudioInputPcm16(input)
 
 val engine = device.audio.requestEngine().engine ?: error("No audio engine")
 engine.useDuplex { duplex ->
-    val captured = checkNotNull(duplex.takeNextInputPcm16())
-    check(captured.contentEquals(input))
+    runBlocking {
+        val captured = duplex.takeNextInputPcm16()
+        check(captured.contentEquals(input))
 
-    duplex.playPcm16(captured)
+        duplex.playPcm16(captured)
+    }
 }
 
 val output = device.drainAudioOutputPcm16()

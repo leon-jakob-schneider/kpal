@@ -7,6 +7,25 @@ GLOBAL_ENV="${CODEX_HOME:-$HOME/.codex}/environments/kpal.env"
 
 [ -f "$GLOBAL_ENV" ] && . "$GLOBAL_ENV"
 
+configure_xcode_tools() {
+  if [ -n "${DEVELOPER_DIR:-}" ] && [ -x "$DEVELOPER_DIR/usr/bin/devicectl" ]; then
+    return
+  fi
+
+  local candidate
+  for candidate in \
+    "$HOME/Applications/Xcode.app/Contents/Developer" \
+    "/Applications/Xcode.app/Contents/Developer"
+  do
+    if [ -x "$candidate/usr/bin/devicectl" ]; then
+      export DEVELOPER_DIR="$candidate"
+      return
+    fi
+  done
+}
+
+configure_xcode_tools
+
 resolve_device_id() {
   if [ -n "${KPAL_IOS_DEVICE_ID:-}" ]; then
     DEVICE_ID="$KPAL_IOS_DEVICE_ID"
